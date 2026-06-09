@@ -32,6 +32,8 @@ class ThirdlawGuardrail(GenericGuardrailAPI):
                 "Thirdlaw api_base is required. Set api_base in the guardrail config "
                 "or the THIRDLAW_API_BASE environment variable."
             )
+        if not resolved_base.endswith("/beta/litellm_basic_guardrail_api"):
+            resolved_base = f"{resolved_base}/beta/litellm_basic_guardrail_api"
 
         resolved_key = api_key or get_secret_str("THIRDLAW_API_KEY")
         merged_headers = dict(headers or {})
