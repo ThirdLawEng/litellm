@@ -194,6 +194,20 @@ describe("guardrail_info_helpers", () => {
       expect(result.displayName).toBe("Noma Security");
       expect(result.logo).toContain("noma_security.png");
     });
+
+    it("should return thirdlaw logo when ui_friendly_name is Thirdlaw", () => {
+      populateGuardrailProviders({
+        thirdlaw: { ui_friendly_name: "Thirdlaw" },
+      });
+      populateGuardrailProviderMap({
+        thirdlaw: { ui_friendly_name: "Thirdlaw" },
+      });
+
+      const result = getGuardrailLogoAndName("thirdlaw");
+
+      expect(result.displayName).toBe("Thirdlaw");
+      expect(result.logo).toContain("thirdlaw.svg");
+    });
   });
 
   describe("skipSystemMessageToChoice / choiceToSkipSystemForCreate", () => {

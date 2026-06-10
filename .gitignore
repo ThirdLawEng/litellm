@@ -124,4 +124,3 @@ crash.*.log
 # and should be committed.
 .vscode
 .pin_list.txt
-.history/
