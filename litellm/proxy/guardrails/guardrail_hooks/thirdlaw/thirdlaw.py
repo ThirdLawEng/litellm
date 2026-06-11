@@ -80,6 +80,7 @@ class ThirdlawGuardrail(GenericGuardrailAPI):
         input_type: Literal["request", "response"],
         logging_obj: Optional["LiteLLMLoggingObj"] = None,
     ) -> GenericGuardrailAPIInputs:
+        inputs["structured_messages"] = inputs.get("structured_messages", request_data.get("messages", [])) or []
         return await super().apply_guardrail(
             inputs=inputs,
             request_data=request_data,
