@@ -1,11 +1,17 @@
 from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Type
 
+import httpx
+import os
 from litellm.integrations.custom_guardrail import log_guardrail_information
 from litellm.proxy.guardrails.guardrail_hooks.generic_guardrail_api.generic_guardrail_api import (
     GenericGuardrailAPI,
 )
 from litellm.secret_managers.main import get_secret_str
 from litellm.types.utils import GenericGuardrailAPIInputs
+from litellm.llms.custom_httpx.http_handler import (
+    get_async_httpx_client,
+    httpxSpecialProvider,
+)
 
 if TYPE_CHECKING:
     from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
@@ -23,30 +29,49 @@ class ThirdlawGuardrail(GenericGuardrailAPI):
         self,
         api_base: Optional[str] = None,
         api_key: Optional[str] = None,
+        additional_headers: Optional[str] = None,
+        ingest_only: Optional[bool] = False,
         headers: Optional[Dict[str, Any]] = None,
+        guardrail_timeout: Optional[int] = 60,
         **kwargs,
     ):
-        resolved_base = api_base or get_secret_str("THIRDLAW_API_BASE")
+        print(f"ThirdlawGuardrail __init__: api_base={api_base}, api_key={api_key}, additional_headers={additional_headers}, ingest_only={ingest_only}, headers={headers}, guardrail_timeout={guardrail_timeout}, kwargs={kwargs}")
+        resolved_base = (api_base or get_secret_str("THIRDLAW_API_BASE") or "").rstrip("/")
         if not resolved_base:
             raise ThirdlawGuardrailMissingConfig(
                 "Thirdlaw api_base is required. Set api_base in the guardrail config "
                 "or the THIRDLAW_API_BASE environment variable."
             )
-        if not resolved_base.endswith("/beta/litellm_basic_guardrail_api"):
-            resolved_base = f"{resolved_base}/beta/litellm_basic_guardrail_api"
 
         resolved_key = api_key or get_secret_str("THIRDLAW_API_KEY")
         merged_headers = dict(headers or {})
         if resolved_key:
             merged_headers["Authorization"] = f"Bearer {resolved_key}"
+        # Merge built-in Qostodian Nexus identifier headers with any caller-supplied extra_headers
+        thirdlaw_headers = []
 
+        if additional_headers:
+            thirdlaw_headers.extend(additional_headers.split(","))
+        existing = kwargs.get("extra_headers") or []
+        kwargs["extra_headers"] = thirdlaw_headers + [
+            h for h in existing if h not in thirdlaw_headers
+        ]
+        guardrail_timeout = guardrail_timeout or int(os.getenv("THIRDLAW_GUARDRAIL_TIMEOUT", 60))
+        self.api_base = resolved_base
+        self.guardrail_timeout = guardrail_timeout
+        self.ingest_only = ingest_only if ingest_only is not None else False
         super().__init__(
             api_base=resolved_base,
             api_key=None,
             headers=merged_headers,
             **kwargs,
         )
-        self.api_base = resolved_base.rstrip("/")
+        self.additional_provider_specific_params["ingest_only"] = ingest_only
+        self.additional_provider_specific_params["guardrail_name"] = self.guardrail_name
+        self.async_handler = get_async_httpx_client(
+            llm_provider=httpxSpecialProvider.GuardrailCallback,
+            params={"timeout": httpx.Timeout(timeout=self.guardrail_timeout, connect=5.0)},
+        )
 
     @log_guardrail_information
     async def apply_guardrail(

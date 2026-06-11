@@ -4,7 +4,6 @@ from pydantic import Field
 
 from litellm.types.proxy.guardrails.guardrail_hooks.base import GuardrailConfigModel
 
-
 class ThirdlawGuardrailConfigModel(GuardrailConfigModel):
     api_base: Optional[str] = Field(
         default=None,
@@ -19,6 +18,19 @@ class ThirdlawGuardrailConfigModel(GuardrailConfigModel):
     api_key: Optional[str] = Field(
         default=None,
         description="API key for Thirdlaw. Env: THIRDLAW_API_KEY.",
+    )
+
+    additional_headers: Optional[str] = Field(
+        default=None,
+        description="Additional headers to forward to the Thirdlaw API. Comma-separated list of header names.",
+    )
+    guardrail_timeout: Optional[int] = Field(
+        default=None,
+        description="Timeout for the Thirdlaw API request. In seconds.",
+    )
+    ingest_only: Optional[bool] = Field(
+        default=False,
+        description="Whether to only ingest the request and response data, without running the guardrail.",
     )
 
     @staticmethod

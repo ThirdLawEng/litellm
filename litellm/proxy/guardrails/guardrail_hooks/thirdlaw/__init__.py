@@ -15,6 +15,9 @@ def initialize_guardrail(litellm_params: "LitellmParams", guardrail: "Guardrail"
         api_base=litellm_params.api_base,
         api_key=litellm_params.api_key,
         headers=getattr(litellm_params, "headers", None),
+        ingest_only=getattr(litellm_params, "ingest_only", False),
+        guardrail_timeout=getattr(litellm_params, "guardrail_timeout", 60),
+        additional_headers=getattr(litellm_params, "additional_headers", None),
         additional_provider_specific_params=getattr(
             litellm_params, "additional_provider_specific_params", {}
         ),
