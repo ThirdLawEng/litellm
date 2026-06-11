@@ -277,8 +277,8 @@ export const GUARDRAIL_PRESETS: Record<string, GuardrailPreset> = {
     defaultOn: false,
   },
   thirdlaw: {
-    provider: "Thirdlaw",
-    guardrailNameSuggestion: "Thirdlaw Guardrail",
+    provider: "ThirdLaw",
+    guardrailNameSuggestion: "ThirdLaw Guardrail",
     mode: "pre_call",
     defaultOn: false,
   },

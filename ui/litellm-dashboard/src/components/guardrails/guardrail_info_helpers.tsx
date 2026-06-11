@@ -53,7 +53,7 @@ export const guardrail_provider_map: Record<string, string> = {
   LlmAsAJudge: "llm_as_a_judge",
   Xecguard: "xecguard",
   QostodianNexus: "qostodian_nexus",
-  Thirdlaw: "thirdlaw",
+  ThirdLaw: "thirdlaw",
 };
 
 // Function to populate provider map from API response - updates the original map
@@ -131,7 +131,7 @@ export const guardrailLogoMap: Record<string, string> = {
   "Guardrails AI": `${asset_logos_folder}guardrails_ai.jpeg`,
   "Lasso Guardrail": `${asset_logos_folder}lasso.png`,
   "Pangea Guardrail": `${asset_logos_folder}pangea.png`,
-  "Thirdlaw": `${asset_logos_folder}thirdlaw.svg`,
+  "ThirdLaw": `${asset_logos_folder}thirdlaw.svg`,
   "AIM Guardrail": `${asset_logos_folder}aim_security.jpeg`,
   "Cato Networks Guardrail": `${asset_logos_folder}cato_networks.svg`,
   "OpenAI Moderation": `${asset_logos_folder}openai_small.svg`,

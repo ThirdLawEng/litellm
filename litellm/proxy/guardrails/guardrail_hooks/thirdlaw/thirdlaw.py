@@ -35,11 +35,10 @@ class ThirdlawGuardrail(GenericGuardrailAPI):
         guardrail_timeout: Optional[int] = 60,
         **kwargs,
     ):
-        print(f"ThirdlawGuardrail __init__: api_base={api_base}, api_key={api_key}, additional_headers={additional_headers}, ingest_only={ingest_only}, headers={headers}, guardrail_timeout={guardrail_timeout}, kwargs={kwargs}")
         resolved_base = (api_base or get_secret_str("THIRDLAW_API_BASE") or "").rstrip("/")
         if not resolved_base:
             raise ThirdlawGuardrailMissingConfig(
-                "Thirdlaw api_base is required. Set api_base in the guardrail config "
+                "ThirdLaw api_base is required. Set api_base in the guardrail config "
                 "or the THIRDLAW_API_BASE environment variable."
             )
 

@@ -424,13 +424,13 @@ export const PARTNER_GUARDRAIL_CARDS: GuardrailCardInfo[] = [
   },
   {
     id: "thirdlaw",
-    name: "Thirdlaw",
+    name: "ThirdLaw",
     description:
-      "Thirdlaw guardrail for content filtering and moderation.",
+      "ThirdLaw guardrail for content filtering and moderation.",
     category: "partner",
     logo: `${ASSET_PREFIX}thirdlaw.svg`,
     tags: ["Security", "Content Filtering", "Moderation", "Guardrail"],
-    providerKey: "Thirdlaw",
+    providerKey: "ThirdLaw",
   },
 ];
 

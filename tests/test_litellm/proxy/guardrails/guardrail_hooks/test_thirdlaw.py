@@ -149,7 +149,7 @@ def test_enum_value():
 
 
 def test_config_model_ui_name():
-    assert ThirdlawGuardrailConfigModel.ui_friendly_name() == "Thirdlaw"
+    assert ThirdlawGuardrailConfigModel.ui_friendly_name() == "ThirdLaw"
 
 
 def test_registries_expose_initializer_and_class():
