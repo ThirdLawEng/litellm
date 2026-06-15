@@ -46,7 +46,7 @@ class ThirdlawGuardrail(GenericGuardrailAPI):
         merged_headers = dict(headers or {})
         if resolved_key:
             merged_headers["Authorization"] = f"Bearer {resolved_key}"
-        # Merge built-in Qostodian Nexus identifier headers with any caller-supplied extra_headers
+
         thirdlaw_headers = []
 
         if additional_headers:
