@@ -60,9 +60,8 @@ class ThirdlawGuardrail(GenericGuardrailAPI):
             GuardrailEventHooks.post_call,
             GuardrailEventHooks.during_call,
         ]
-        guardrail_timeout = guardrail_timeout or int(os.getenv("THIRDLAW_GUARDRAIL_TIMEOUT", 60))
         self.api_base = resolved_base
-        self.guardrail_timeout = guardrail_timeout
+        self.guardrail_timeout = httpx.Timeout(timeout=guardrail_timeout, connect=5.0)
         super().__init__(
             api_base=resolved_base,
             api_key=None,
@@ -71,7 +70,7 @@ class ThirdlawGuardrail(GenericGuardrailAPI):
         )
         self.async_handler = get_async_httpx_client(
             llm_provider=httpxSpecialProvider.GuardrailCallback,
-            params={"timeout": httpx.Timeout(timeout=self.guardrail_timeout, connect=5.0)},
+            params={"timeout": self.guardrail_timeout},
         )
 
     @log_guardrail_information

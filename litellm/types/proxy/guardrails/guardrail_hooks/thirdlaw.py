@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Literal
 
 from pydantic import Field
 
@@ -24,8 +24,13 @@ class ThirdlawGuardrailConfigModel(GuardrailConfigModel):
         default=None,
         description="Additional headers to forward to the ThirdLaw API. Comma-separated list of header names.",
     )
+    unreachable_fallback: Literal["fail_closed", "fail_open"] = Field(
+        default="fail_closed",
+        description="What to do when ThirdLaw is unreachable. 'fail_open' = allow, 'fail_closed' = block.",
+    )
+
     guardrail_timeout: Optional[int] = Field(
-        default=None,
+        default=60,
         description="Timeout for the ThirdLaw API request. In seconds.",
     )
 
