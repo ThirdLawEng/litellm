@@ -28,10 +28,6 @@ class ThirdlawGuardrailConfigModel(GuardrailConfigModel):
         default=None,
         description="Timeout for the ThirdLaw API request. In seconds.",
     )
-    ingest_only: Optional[bool] = Field(
-        default=False,
-        description="Whether to only ingest the request and response data, without running the guardrail.",
-    )
 
     @staticmethod
     def ui_friendly_name() -> str:
