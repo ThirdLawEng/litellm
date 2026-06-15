@@ -28,27 +28,11 @@ class ThirdlawGuardrailMissingConfig(ValueError):
 class ThirdlawGuardrail(GenericGuardrailAPI):
     def __init__(
         self,
-        api_base: Optional[str] = None,
-        api_key: Optional[str] = None,
         additional_headers: Optional[str] = None,
-        headers: Optional[Dict[str, Any]] = None,
         guardrail_timeout: Optional[int] = 60,
         **kwargs,
     ):
-        resolved_base = (api_base or get_secret_str("THIRDLAW_API_BASE") or "").rstrip("/")
-        if not resolved_base:
-            raise ThirdlawGuardrailMissingConfig(
-                "ThirdLaw api_base is required. Set api_base in the guardrail config "
-                "or the THIRDLAW_API_BASE environment variable."
-            )
-
-        resolved_key = api_key or get_secret_str("THIRDLAW_API_KEY")
-        merged_headers = dict(headers or {})
-        if resolved_key:
-            merged_headers["Authorization"] = f"Bearer {resolved_key}"
-
         thirdlaw_headers = []
-
         if additional_headers:
             thirdlaw_headers.extend(additional_headers.split(","))
         existing = kwargs.get("extra_headers") or []
@@ -60,12 +44,8 @@ class ThirdlawGuardrail(GenericGuardrailAPI):
             GuardrailEventHooks.post_call,
             GuardrailEventHooks.during_call,
         ]
-        self.api_base = resolved_base
         self.guardrail_timeout = httpx.Timeout(timeout=guardrail_timeout, connect=5.0)
         super().__init__(
-            api_base=resolved_base,
-            api_key=None,
-            headers=merged_headers,
             **kwargs,
         )
         self.async_handler = get_async_httpx_client(

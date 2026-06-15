@@ -10,8 +10,7 @@ class ThirdlawGuardrailConfigModel(GuardrailConfigModel):
         description="ThirdLaw Guardrail API Base URL. Env: THIRDLAW_API_BASE.",
         json_schema_extra={
             "examples": [
-                "http://localhost:9090",
-                "https://guardrails.thirdlaw.com",
+                "https://api.thirdlaw.<your-domain>",
             ]
         },
     )
@@ -22,11 +21,11 @@ class ThirdlawGuardrailConfigModel(GuardrailConfigModel):
 
     additional_headers: Optional[str] = Field(
         default=None,
-        description="Additional headers to forward to the ThirdLaw API. Comma-separated list of header names.",
+        description="Comma-separated list of inbound request header names whose values ThirdLaw should receive. All inbound headers are forwarded, but only headers listed here have their actual values exposed; others are forwarded as [present]. Example: x-request-id,x-correlation-id.",
     )
     unreachable_fallback: Literal["fail_closed", "fail_open"] = Field(
         default="fail_closed",
-        description="What to do when ThirdLaw is unreachable. 'fail_open' = allow, 'fail_closed' = block.",
+        description="Controls LiteLLM behavior when ThirdLaw is unavailable or returns a non-policy error. fail_closed blocks the request with 500. fail_open allows the request to continue. A block decision from ThirdLaw always returns 400 regardless of this setting.",
     )
 
     guardrail_timeout: Optional[int] = Field(
