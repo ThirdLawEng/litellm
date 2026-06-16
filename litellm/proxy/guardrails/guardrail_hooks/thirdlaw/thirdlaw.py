@@ -29,6 +29,7 @@ class ThirdlawGuardrail(GenericGuardrailAPI):
     def __init__(
         self,
         api_base: Optional[str] = None,
+        api_key: Optional[str] = None,
         additional_headers: Optional[str] = None,
         guardrail_timeout: Optional[int] = 60,
         **kwargs,
@@ -39,6 +40,7 @@ class ThirdlawGuardrail(GenericGuardrailAPI):
                 "ThirdLaw api_base is required. Set api_base in the guardrail "
                 "config or the THIRDLAW_API_BASE environment variable."
             )
+        resolved_key = api_key or get_secret_str("THIRDLAW_API_KEY")
         thirdlaw_headers = []
         if additional_headers:
             thirdlaw_headers.extend(additional_headers.split(","))
@@ -49,6 +51,7 @@ class ThirdlawGuardrail(GenericGuardrailAPI):
         self.guardrail_timeout = httpx.Timeout(timeout=guardrail_timeout, connect=5.0)
         super().__init__(
             api_base=resolved_base,
+            api_key=resolved_key,
             **kwargs,
         )
         self.async_handler = get_async_httpx_client(

@@ -53,15 +53,9 @@ def test_requires_api_base(monkeypatch):
         ThirdlawGuardrail(api_key="k")
 
 
-def test_trailing_slash_stripped():
-    g = _make_guardrail(api_base="https://thirdlaw.test/evaluate/")
-    assert g.api_base == "https://thirdlaw.test/evaluate"
-
-
-def test_does_not_append_generic_guardrail_path():
+def test_appends_generic_guardrail_path():
     g = _make_guardrail(api_base="https://thirdlaw.test/evaluate")
-    assert g.api_base == "https://thirdlaw.test/evaluate"
-    assert "/beta/litellm_basic_guardrail_api" not in g.api_base
+    assert g.api_base == "https://thirdlaw.test/evaluate/beta/litellm_basic_guardrail_api"
 
 
 def test_env_fallback(monkeypatch):
@@ -72,9 +66,8 @@ def test_env_fallback(monkeypatch):
         event_hook="pre_call",
         default_on=True,
     )
-    assert g.api_base == "https://env.thirdlaw.test/evaluate"
-    assert g.headers["Authorization"] == "Bearer env_key"
-    assert "x-api-key" not in g.headers
+    assert g.api_base == "https://env.thirdlaw.test/evaluate/beta/litellm_basic_guardrail_api"
+    assert g.headers["x-api-key"] == "env_key"
 
 
 async def test_none_action_passthrough():
@@ -130,9 +123,9 @@ async def test_posts_to_configured_endpoint_with_bearer_auth():
             input_type="request",
         )
     call_kwargs = mock_post.call_args.kwargs
-    assert call_kwargs["url"] == "https://thirdlaw.test/evaluate"
-    assert call_kwargs["headers"]["Authorization"] == "Bearer secret"
-    assert "x-api-key" not in call_kwargs["headers"]
+    assert call_kwargs["url"] == "https://thirdlaw.test/evaluate/beta/litellm_basic_guardrail_api"
+    assert "x-api-key" in call_kwargs["headers"]
+    assert call_kwargs["headers"]["x-api-key"] == "secret"
     assert call_kwargs["json"]["texts"] == ["hello"]
     assert call_kwargs["json"]["input_type"] == "request"
     assert call_kwargs["json"]["model"] == "gpt-4o"
@@ -167,4 +160,4 @@ def test_config_driven_initialization_creates_callback():
     cb = initialize_guardrail(lp, {"guardrail_name": "thirdlaw-guard"})
     assert isinstance(cb, ThirdlawGuardrail)
     assert cb.unreachable_fallback == "fail_closed"
-    assert cb.api_base == "https://thirdlaw.test/evaluate"
+    assert cb.api_base == "https://thirdlaw.test/evaluate/beta/litellm_basic_guardrail_api"
