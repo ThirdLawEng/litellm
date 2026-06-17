@@ -455,6 +455,16 @@ export const PARTNER_GUARDRAIL_CARDS: GuardrailCardInfo[] = [
     providerKey: "Repelloai",
   },
   {
+    id: "thirdlaw",
+    name: "ThirdLaw",
+    description:
+      "ThirdLaw guardrail for content filtering and moderation.",
+    category: "partner",
+    logo: guardrailLogoMap["ThirdLaw"],
+    tags: ["Security", "Content Filtering", "Moderation", "Guardrail"],
+    providerKey: "ThirdLaw",
+  },
+  {
     id: "straiker",
     name: "Straiker",
     description:
