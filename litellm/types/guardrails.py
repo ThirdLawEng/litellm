@@ -55,6 +55,8 @@ from litellm.types.proxy.guardrails.guardrail_hooks.cisco_ai_defense import (
 )
 from litellm.types.proxy.guardrails.guardrail_hooks.headroom import (
     HeadroomGuardrailConfigModel,
+from litellm.types.proxy.guardrails.guardrail_hooks.thirdlaw import (
+    ThirdlawGuardrailConfigModel,
 )
 
 """
@@ -123,6 +125,7 @@ class SupportedGuardrailIntegrations(Enum):
     VIGIL_GUARD = "vigil_guard"
     REPELLOAI = "repelloai"
     HEADROOM = "headroom"
+    THIRDLAW = "thirdlaw"
 
 
 class Role(Enum):
@@ -810,6 +813,7 @@ class LitellmParams(
     HiddenlayerGuardrailConfigModel,
     QostodianNexusConfigModel,
     VigilGuardGuardrailConfigModel,
+    ThirdlawGuardrailConfigModel,
 ):
     guardrail: str = Field(description="The type of guardrail integration to use")
     mode: Union[str, List[str], Mode] = Field(
