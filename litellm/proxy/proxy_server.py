@@ -14644,6 +14644,18 @@ async def update_config_general_settings(
     return response
 
 
+# Secret-bearing general_settings field names the segment masker does not
+# already match (database_url embeds the DB password)
+_EXTRA_SECRET_GENERAL_SETTINGS_FIELDS = frozenset({"database_url"})
+
+
+def _is_secret_general_setting_field(field_name: str) -> bool:
+    return (
+        field_name in _EXTRA_SECRET_GENERAL_SETTINGS_FIELDS
+        or SENSITIVE_DATA_MASKER.is_sensitive_key(field_name)
+    )
+
+
 @router.get(
     "/config/field/info",
     tags=["config.yaml"],
@@ -14696,9 +14708,15 @@ async def get_config_general_settings(
         general_settings = dict(db_general_settings.param_value)
 
         if field_name in general_settings:
-            return ConfigFieldInfo(
-                field_name=field_name, field_value=general_settings[field_name]
-            )
+            # only a full PROXY_ADMIN sees raw secret-bearing fields; others
+            # get them redacted
+            field_value = general_settings[field_name]
+            if (
+                user_api_key_dict.user_role != LitellmUserRoles.PROXY_ADMIN
+                and _is_secret_general_setting_field(field_name)
+            ):
+                field_value = "REDACTED"
+            return ConfigFieldInfo(field_name=field_name, field_value=field_value)
         else:
             raise HTTPException(
                 status_code=400,
