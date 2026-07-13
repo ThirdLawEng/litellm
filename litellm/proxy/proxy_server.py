@@ -6192,18 +6192,39 @@ class ProxyConfig:
                     prisma_client=prisma_client
                 )
             )
-            verbose_proxy_logger.debug(
-                "guardrails from the DB %s", str(guardrails_in_db)
+        except Exception as e:
+            verbose_proxy_logger.exception(
+                "litellm.proxy.proxy_server.py::ProxyConfig:_init_guardrails_in_db - "
+                "failed to fetch guardrails from DB - {}".format(str(e))
             )
-            db_guardrail_ids: set = set()
-            for guardrail in guardrails_in_db:
-                guardrail_id = guardrail.get("guardrail_id")
-                if guardrail_id:
-                    db_guardrail_ids.add(guardrail_id)
+            return
+
+        verbose_proxy_logger.debug("guardrails from the DB %s", str(guardrails_in_db))
+        db_guardrail_ids: set = set()
+        for guardrail in guardrails_in_db:
+            guardrail_id = guardrail.get("guardrail_id")
+            if guardrail_id:
+                db_guardrail_ids.add(guardrail_id)
+            try:
                 IN_MEMORY_GUARDRAIL_HANDLER.sync_guardrail_from_db(
                     guardrail=cast(Guardrail, guardrail),
                 )
+            except Exception as e:
+                # Don't let one guardrail's sync failure abort the rest of
+                # this tick's loop (or skip reconciliation below). The
+                # previous in-memory guardrail for this guardrail_id (if any)
+                # is left untouched by a failed sync, so it keeps working.
+                verbose_proxy_logger.exception(
+                    "litellm.proxy.proxy_server.py::ProxyConfig:_init_guardrails_in_db - "
+                    "failed to sync guardrail_id=%s guardrail_name=%s from DB; "
+                    "keeping previous in-memory state for this guardrail - %s",
+                    guardrail_id,
+                    guardrail.get("guardrail_name"),
+                    str(e),
+                )
+                continue
 
+        try:
             # Drop in-memory DB-backed entries whose row was deleted on another
             # pod. Config-loaded entries are never touched.
             IN_MEMORY_GUARDRAIL_HANDLER.reconcile_db_guardrails(
@@ -6211,9 +6232,8 @@ class ProxyConfig:
             )
         except Exception as e:
             verbose_proxy_logger.exception(
-                "litellm.proxy.proxy_server.py::ProxyConfig:_init_guardrails_in_db - {}".format(
-                    str(e)
-                )
+                "litellm.proxy.proxy_server.py::ProxyConfig:_init_guardrails_in_db - "
+                "failed to reconcile stale DB guardrails - {}".format(str(e))
             )
 
     async def _init_policies_in_db(self, prisma_client: PrismaClient):

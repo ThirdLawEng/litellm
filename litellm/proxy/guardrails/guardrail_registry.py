@@ -3,7 +3,7 @@
 import importlib
 import os
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Literal, Optional, Set, Type, cast
+from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Type, cast
 
 import litellm
 from litellm import Router
@@ -410,6 +410,126 @@ class InMemoryGuardrailHandler:
         and never deleted by reconciliation.
         """
 
+    @staticmethod
+    def _resolve_env_secret_value(
+        raw_value: Optional[str], field_name: str
+    ) -> Optional[str]:
+        """
+        Resolve a single os.environ/-prefixed guardrail field value.
+
+        Returns raw_value unchanged if it isn't an os.environ/ reference.
+        Raises ValueError if the referenced env var resolves empty/None -
+        guard at resolution time instead of passing the literal string
+        "None" downstream.
+        """
+        if not (isinstance(raw_value, str) and raw_value.startswith("os.environ/")):
+            return raw_value
+        resolved_value = get_secret(raw_value)
+        if not resolved_value:
+            raise ValueError(
+                f"Guardrail field '{field_name}' references '{raw_value}' but "
+                "the referenced environment variable is not set (or resolved empty)."
+            )
+        return str(resolved_value)
+
+    def _build_guardrail_instance(
+        self,
+        guardrail: Guardrail,
+        config_file_path: Optional[str] = None,
+        llm_router: Optional["Router"] = None,
+    ) -> Tuple[Guardrail, Optional[CustomGuardrail]]:
+        """
+        Build a Guardrail + its CustomGuardrail callback without touching
+        IN_MEMORY_GUARDRAILS / guardrail_id_to_custom_guardrail / _sources.
+
+        Raises on failure. If a custom_guardrail_callback was already
+        constructed (and self-registered into litellm.callbacks by the
+        initializer) before the failure, it is removed from litellm.callbacks
+        before re-raising so failed rebuilds don't leave orphaned callbacks
+        behind.
+        """
+        custom_guardrail_callback: Optional[CustomGuardrail] = None
+        try:
+            litellm_params_data = guardrail["litellm_params"]
+            verbose_proxy_logger.debug("litellm_params= %s", litellm_params_data)
+
+            if isinstance(litellm_params_data, dict):
+                litellm_params = LitellmParams(**litellm_params_data)
+            else:
+                litellm_params = litellm_params_data
+
+            if (
+                "category_thresholds" in litellm_params_data
+                and litellm_params_data["category_thresholds"]
+            ):
+                lakera_category_thresholds = LakeraCategoryThresholds(
+                    **litellm_params_data["category_thresholds"]
+                )
+                litellm_params.category_thresholds = lakera_category_thresholds
+
+            litellm_params.api_key = self._resolve_env_secret_value(
+                litellm_params.api_key, "api_key"
+            )
+            litellm_params.api_base = self._resolve_env_secret_value(
+                litellm_params.api_base, "api_base"
+            )
+
+            guardrail_type = litellm_params.guardrail
+
+            if guardrail_type is None:
+                raise ValueError("guardrail_type is required")
+
+            initializer = guardrail_initializer_registry.get(guardrail_type)
+
+            if initializer:
+                # Try to call with llm_router first, fall back to without if it fails
+                import inspect
+
+                sig = inspect.signature(initializer)
+                if "llm_router" in sig.parameters:
+                    custom_guardrail_callback = initializer(
+                        litellm_params, guardrail, llm_router  # type: ignore
+                    )
+                else:
+                    custom_guardrail_callback = initializer(litellm_params, guardrail)
+            elif isinstance(guardrail_type, str) and "." in guardrail_type:
+                custom_guardrail_callback = self.initialize_custom_guardrail(
+                    guardrail=cast(dict, guardrail),
+                    guardrail_type=guardrail_type,
+                    litellm_params=litellm_params,
+                    config_file_path=config_file_path,
+                )
+            else:
+                raise ValueError(f"Unsupported guardrail: {guardrail_type}")
+
+            if custom_guardrail_callback is not None:
+                setattr(
+                    custom_guardrail_callback,
+                    "skip_system_message_in_guardrail",
+                    getattr(litellm_params, "skip_system_message_in_guardrail", None),
+                )
+                setattr(
+                    custom_guardrail_callback,
+                    "skip_tool_message_in_guardrail",
+                    getattr(litellm_params, "skip_tool_message_in_guardrail", None),
+                )
+
+            parsed_guardrail = Guardrail(
+                guardrail_id=guardrail.get("guardrail_id"),
+                guardrail_name=guardrail["guardrail_name"],
+                litellm_params=litellm_params,
+            )
+
+            return parsed_guardrail, custom_guardrail_callback
+        except Exception:
+            if custom_guardrail_callback is not None:
+                litellm.logging_callback_manager.remove_callback_from_list_by_object(
+                    callback_list=litellm.callbacks,  # type: ignore
+                    obj=custom_guardrail_callback,
+                    require_self=False,
+                )
+            raise
+
     def initialize_guardrail(
         self,
         guardrail: Guardrail,
@@ -434,76 +554,10 @@ class InMemoryGuardrailHandler:
             self._sources[guardrail_id] = source
             return self.IN_MEMORY_GUARDRAILS[guardrail_id]
 
-        custom_guardrail_callback: Optional[CustomGuardrail] = None
-        litellm_params_data = guardrail["litellm_params"]
-        verbose_proxy_logger.debug("litellm_params= %s", litellm_params_data)
-
-        if isinstance(litellm_params_data, dict):
-            litellm_params = LitellmParams(**litellm_params_data)
-        else:
-            litellm_params = litellm_params_data
-
-        if (
-            "category_thresholds" in litellm_params_data
-            and litellm_params_data["category_thresholds"]
-        ):
-            lakera_category_thresholds = LakeraCategoryThresholds(
-                **litellm_params_data["category_thresholds"]
-            )
-            litellm_params.category_thresholds = lakera_category_thresholds
-
-        if litellm_params.api_key and litellm_params.api_key.startswith("os.environ/"):
-            litellm_params.api_key = str(get_secret(litellm_params.api_key))
-
-        if litellm_params.api_base and litellm_params.api_base.startswith(
-            "os.environ/"
-        ):
-            litellm_params.api_base = str(get_secret(litellm_params.api_base))
-
-        guardrail_type = litellm_params.guardrail
-
-        if guardrail_type is None:
-            raise ValueError("guardrail_type is required")
-
-        initializer = guardrail_initializer_registry.get(guardrail_type)
-
-        if initializer:
-            # Try to call with llm_router first, fall back to without if it fails
-            import inspect
-
-            sig = inspect.signature(initializer)
-            if "llm_router" in sig.parameters:
-                custom_guardrail_callback = initializer(
-                    litellm_params, guardrail, llm_router  # type: ignore
-                )
-            else:
-                custom_guardrail_callback = initializer(litellm_params, guardrail)
-        elif isinstance(guardrail_type, str) and "." in guardrail_type:
-            custom_guardrail_callback = self.initialize_custom_guardrail(
-                guardrail=cast(dict, guardrail),
-                guardrail_type=guardrail_type,
-                litellm_params=litellm_params,
-                config_file_path=config_file_path,
-            )
-        else:
-            raise ValueError(f"Unsupported guardrail: {guardrail_type}")
-
-        if custom_guardrail_callback is not None:
-            setattr(
-                custom_guardrail_callback,
-                "skip_system_message_in_guardrail",
-                getattr(litellm_params, "skip_system_message_in_guardrail", None),
-            )
-            setattr(
-                custom_guardrail_callback,
-                "skip_tool_message_in_guardrail",
-                getattr(litellm_params, "skip_tool_message_in_guardrail", None),
-            )
-
-        parsed_guardrail = Guardrail(
-            guardrail_id=guardrail.get("guardrail_id"),
-            guardrail_name=guardrail["guardrail_name"],
-            litellm_params=litellm_params,
+        parsed_guardrail, custom_guardrail_callback = self._build_guardrail_instance(
+            guardrail=guardrail,
+            config_file_path=config_file_path,
+            llm_router=llm_router,
         )
 
         # store references to the guardrail in memory
@@ -685,6 +739,37 @@ class InMemoryGuardrailHandler:
             else new_params
         )
 
+        # The in-memory copy already has os.environ/-prefixed api_key/api_base
+        # resolved to their actual secret values (done once at build time in
+        # _build_guardrail_instance), while the freshly-fetched DB copy still
+        # holds the raw "os.environ/VAR_NAME" reference. Resolve those two
+        # fields on new_dict before diffing so a guardrail configured via env
+        # var references doesn't look "changed" on every single poll tick. If
+        # resolution fails (e.g. the env var is transiently unset on this
+        # worker), fall back to the existing resolved value instead of
+        # treating it as a real change - a real reinit attempt would fail the
+        # same way moments later anyway.
+        if new_dict is not None:
+            for secret_field in ("api_key", "api_base"):
+                if secret_field not in new_dict:
+                    continue
+                try:
+                    new_dict[secret_field] = self._resolve_env_secret_value(
+                        new_dict.get(secret_field), secret_field
+                    )
+                except ValueError:
+                    verbose_proxy_logger.warning(
+                        "Guardrail '%s' (ID: %s): could not resolve '%s' secret "
+                        "while checking for DB changes this poll tick; keeping "
+                        "previous value for comparison purposes.",
+                        new_guardrail.get("guardrail_name"),
+                        guardrail_id,
+                        secret_field,
+                    )
+                    new_dict[secret_field] = (
+                        existing_dict.get(secret_field) if existing_dict else None
+                    )
+
         # Compare and identify specific differences
         changed_fields = {}
         if existing_dict is not None and new_dict is not None:
@@ -714,7 +799,13 @@ class InMemoryGuardrailHandler:
     ) -> Optional[Guardrail]:
         """
         Force re-initialization of a guardrail even if it exists in memory.
-        Removes old callback from litellm.callbacks and creates fresh instance.
+
+        Builds the replacement FIRST - if that fails, the existing
+        (working) in-memory guardrail and its litellm.callbacks
+        registration are left completely untouched, so a transient rebuild
+        failure (e.g. an env var briefly unresolvable) can never silently
+        drop an already-working guardrail. Only swaps in the new instance
+        once the build succeeds.
         """
         guardrail_id = guardrail.get("guardrail_id")
         if not guardrail_id:
@@ -723,14 +814,19 @@ class InMemoryGuardrailHandler:
             )
             return None
 
-        # Remove from memory if exists (also removes from callbacks)
+        parsed_guardrail, custom_guardrail_callback = self._build_guardrail_instance(
+            guardrail=guardrail, config_file_path=config_file_path
+        )
+
+        # Build succeeded - now safe to tear down the old registration.
         if guardrail_id in self.IN_MEMORY_GUARDRAILS:
             self.delete_in_memory_guardrail(guardrail_id)
 
-        # Initialize fresh (will add new callback to litellm.callbacks)
-        return self.initialize_guardrail(
-            guardrail=guardrail, config_file_path=config_file_path, source=source
-        )
+        self.IN_MEMORY_GUARDRAILS[guardrail_id] = parsed_guardrail
+        self.guardrail_id_to_custom_guardrail[guardrail_id] = custom_guardrail_callback
+        self._sources[guardrail_id] = source
+
+        return parsed_guardrail
 
     def sync_guardrail_from_db(
         self, guardrail: Guardrail, config_file_path: Optional[str] = None

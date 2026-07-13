@@ -1,3 +1,5 @@
+import pytest
+
 from litellm.integrations.custom_guardrail import CustomGuardrail
 from litellm.proxy.guardrails.guardrail_registry import (
     get_guardrail_initializer_from_hooks,
@@ -180,3 +182,116 @@ def test_sync_guardrail_from_db_marks_source_db_when_unchanged():
     handler.sync_guardrail_from_db(g)
 
     assert handler.get_source("collide") == "db"
+
+
+def test_reinitialize_guardrail_leaves_old_guardrail_intact_on_build_failure():
+    """
+    A failed rebuild (e.g. transient error, unsupported/misconfigured
+    guardrail type) must never tear down an already-working guardrail. Build
+    the replacement first; only swap in the new one once it succeeds.
+    """
+    handler = InMemoryGuardrailHandler()
+    working = _make_guardrail("gid", name="bedrock")
+    working_callback = CustomGuardrail(
+        guardrail_name="bedrock",
+        default_on=False,
+        event_hook=GuardrailEventHooks.pre_call,
+    )
+    handler.IN_MEMORY_GUARDRAILS["gid"] = working
+    handler.guardrail_id_to_custom_guardrail["gid"] = working_callback
+    handler._sources["gid"] = "db"
+
+    broken = Guardrail(
+        guardrail_id="gid",
+        guardrail_name="bedrock",
+        litellm_params=LitellmParams(
+            guardrail="not-a-real-guardrail-type", mode="pre_call", default_on=False
+        ),
+    )
+
+    with pytest.raises(ValueError):
+        handler.reinitialize_guardrail(guardrail=broken, source="db")
+
+    assert handler.IN_MEMORY_GUARDRAILS["gid"] is working
+    assert handler.guardrail_id_to_custom_guardrail["gid"] is working_callback
+    assert handler._sources["gid"] == "db"
+
+
+def test_resolve_env_secret_value_passthrough_and_errors(monkeypatch):
+    assert (
+        InMemoryGuardrailHandler._resolve_env_secret_value("literal-value", "api_key")
+        == "literal-value"
+    )
+    assert (
+        InMemoryGuardrailHandler._resolve_env_secret_value(None, "api_key") is None
+    )
+
+    monkeypatch.setenv("TEST_GUARDRAIL_SECRET", "resolved-value")
+    assert (
+        InMemoryGuardrailHandler._resolve_env_secret_value(
+            "os.environ/TEST_GUARDRAIL_SECRET", "api_key"
+        )
+        == "resolved-value"
+    )
+
+    monkeypatch.delenv("TEST_GUARDRAIL_UNSET_SECRET", raising=False)
+    with pytest.raises(ValueError):
+        InMemoryGuardrailHandler._resolve_env_secret_value(
+            "os.environ/TEST_GUARDRAIL_UNSET_SECRET", "api_key"
+        )
+
+
+def test_has_guardrail_params_changed_stable_for_resolved_env_secret(monkeypatch):
+    """
+    The in-memory copy holds the resolved secret value (post-build), while a
+    freshly-fetched DB row always holds the raw os.environ/ reference. These
+    must compare as unchanged so a guardrail configured via env var
+    references isn't torn down and rebuilt on every DB polling tick.
+    """
+    monkeypatch.setenv("TEST_GUARDRAIL_SECRET", "resolved-value")
+    handler = InMemoryGuardrailHandler()
+
+    existing = Guardrail(
+        guardrail_id="gid",
+        guardrail_name="bedrock",
+        litellm_params=LitellmParams(
+            guardrail="bedrock",
+            mode="pre_call",
+            default_on=False,
+            api_key="resolved-value",
+        ),
+    )
+    handler.IN_MEMORY_GUARDRAILS["gid"] = existing
+
+    from_db_same_secret = Guardrail(
+        guardrail_id="gid",
+        guardrail_name="bedrock",
+        litellm_params=LitellmParams(
+            guardrail="bedrock",
+            mode="pre_call",
+            default_on=False,
+            api_key="os.environ/TEST_GUARDRAIL_SECRET",
+        ),
+    )
+    assert (
+        handler._has_guardrail_params_changed("gid", from_db_same_secret) is False
+    )
+
+    from_db_different_secret = Guardrail(
+        guardrail_id="gid",
+        guardrail_name="bedrock",
+        litellm_params=LitellmParams(
+            guardrail="bedrock",
+            mode="pre_call",
+            default_on=False,
+            api_key="a-genuinely-different-value",
+        ),
+    )
+    assert (
+        handler._has_guardrail_params_changed("gid", from_db_different_secret) is True
+    )
+
+    monkeypatch.delenv("TEST_GUARDRAIL_SECRET", raising=False)
+    assert (
+        handler._has_guardrail_params_changed("gid", from_db_same_secret) is False
+    )
