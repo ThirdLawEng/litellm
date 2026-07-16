@@ -5685,9 +5685,6 @@ class ProxyConfig:
                     db_general_settings=db_general_settings.param_value,
                 )
 
-            # initialize vector stores, guardrails, etc. table in db
-            await self._init_non_llm_objects_in_db(prisma_client=prisma_client)
-
         except Exception as e:
             verbose_proxy_logger.exception(
                 "litellm.proxy.proxy_server.py::ProxyConfig:add_deployment - {}".format(
@@ -7506,6 +7503,26 @@ class ProxyStartupEvent:
                 misfire_grace_time=APSCHEDULER_MISFIRE_GRACE_TIME,
             )
             await proxy_config.get_credentials(prisma_client=prisma_client)
+
+        ### SYNC NON-LLM DB OBJECTS (guardrails, policies, vector stores, MCP servers, prompts, search tools, agents, pass-through endpoints) ###
+        # Intentionally NOT gated behind store_model_in_db - that flag controls
+        # model persistence only. These object types are unrelated to models
+        # and must load on every proxy startup (and stay in sync) regardless,
+        # otherwise a DB-backed guardrail added via the admin API/UI only
+        # lives in the memory of the pod that "immediate synced" it and is
+        # silently lost on the next pod restart/redeploy.
+        scheduler.add_job(
+            proxy_config._init_non_llm_objects_in_db,
+            "interval",
+            seconds=30,
+            args=[prisma_client],
+            id="sync_non_llm_objects_job",
+            replace_existing=True,
+            misfire_grace_time=APSCHEDULER_MISFIRE_GRACE_TIME,
+        )
+
+        # this will load all existing guardrails, policies, vector stores, etc. on proxy startup
+        await proxy_config._init_non_llm_objects_in_db(prisma_client=prisma_client)
 
         await cls._initialize_slack_alerting_jobs(
             scheduler=scheduler,

@@ -5513,6 +5513,88 @@ async def test_store_model_in_db_db_failure_graceful(monkeypatch):
         mock_proxy_config.add_deployment.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_non_llm_objects_load_regardless_of_store_model_in_db(monkeypatch):
+    """
+    Guardrails (and other non-LLM DB objects: policies, vector stores, MCP
+    servers, prompts, search tools) must load on proxy startup and stay
+    synced even when store_model_in_db is False/unset. A guardrail added via
+    the admin API only lives in the memory of the pod that "immediate
+    synced" it, and store_model_in_db controls MODEL persistence only - it
+    must never gate guardrail loading, otherwise a pod restart silently
+    drops every DB-backed guardrail with no error.
+    """
+    monkeypatch.delenv("STORE_MODEL_IN_DB", raising=False)
+    from litellm.proxy.proxy_server import ProxyStartupEvent
+    from litellm.proxy.utils import ProxyLogging
+
+    mock_prisma_client = MagicMock()
+    mock_prisma_client.db.litellm_config.find_first = AsyncMock(return_value=None)
+
+    mock_proxy_logging = MagicMock(spec=ProxyLogging)
+    mock_proxy_logging.slack_alerting_instance = MagicMock()
+    mock_proxy_config = AsyncMock()
+
+    with (
+        patch("litellm.proxy.proxy_server.proxy_config", mock_proxy_config),
+        patch("litellm.proxy.proxy_server.store_model_in_db", False),
+        patch("litellm.proxy.proxy_server.get_secret_bool", return_value=False),
+    ):
+        await ProxyStartupEvent.initialize_scheduled_background_jobs(
+            general_settings={},
+            prisma_client=mock_prisma_client,
+            proxy_budget_rescheduler_min_time=1,
+            proxy_budget_rescheduler_max_time=2,
+            proxy_batch_write_at=5,
+            proxy_logging_obj=mock_proxy_logging,
+        )
+
+        import litellm.proxy.proxy_server as ps
+
+        # store_model_in_db stays False - models should NOT have been synced
+        assert ps.store_model_in_db is False
+        mock_proxy_config.add_deployment.assert_not_called()
+
+        # ...but non-LLM objects (guardrails, etc.) must still load on startup
+        mock_proxy_config._init_non_llm_objects_in_db.assert_called_once_with(
+            prisma_client=mock_prisma_client
+        )
+
+        # and a periodic job must be scheduled to keep them in sync,
+        # independent of the store_model_in_db-gated "add_deployment_job"
+        assert ps.scheduler.get_job("sync_non_llm_objects_job") is not None
+
+
+@pytest.mark.asyncio
+async def test_add_deployment_does_not_sync_non_llm_objects():
+    """
+    add_deployment should be model-syncing only. Guardrails/policies/vector
+    stores/etc. are synced via their own independent startup call + job (see
+    test_non_llm_objects_load_regardless_of_store_model_in_db) so they aren't
+    accidentally tied to store_model_in_db again in the future.
+    """
+    from litellm.proxy.proxy_server import ProxyConfig
+    from litellm.proxy.utils import PrismaClient, ProxyLogging
+
+    mock_prisma_client = MagicMock(spec=PrismaClient)
+    mock_prisma_client.db = MagicMock()
+    mock_prisma_client.db.litellm_config = MagicMock()
+    mock_prisma_client.db.litellm_config.find_first = AsyncMock(return_value=None)
+
+    mock_proxy_logging = MagicMock(spec=ProxyLogging)
+
+    proxy_config = ProxyConfig()
+    proxy_config._should_load_db_object = MagicMock(return_value=False)
+    proxy_config._init_non_llm_objects_in_db = AsyncMock()
+
+    await proxy_config.add_deployment(
+        prisma_client=mock_prisma_client,
+        proxy_logging_obj=mock_proxy_logging,
+    )
+
+    proxy_config._init_non_llm_objects_in_db.assert_not_called()
+
+
 # =====================================================================
 # Spend counter tests (v2 — Redis-backed spend counters)
 # =====================================================================
@@ -5859,15 +5941,16 @@ async def test_primary_spend_counter_redis_concurrent_seed_does_not_double_seed(
         if call.kwargs.get("nx") is True
     ]
     assert len(nx_writes) == 2
-    assert sorted(set_results) == [False, True], (
-        f"expected exactly one SET NX winner and one loser, got {set_results}"
-    )
+    assert sorted(set_results) == [
+        False,
+        True,
+    ], f"expected exactly one SET NX winner and one loser, got {set_results}"
     # Loser path executed: after the winner's SET NX returned True, the
     # losing coalesced() call falls back to async_get_cache to read the
     # winner's value rather than re-seeding.
-    assert get_after_set_count >= 1, (
-        "loser branch (else: read back winner's value) was never exercised"
-    )
+    assert (
+        get_after_set_count >= 1
+    ), "loser branch (else: read back winner's value) was never exercised"
 
 
 @pytest.mark.asyncio
