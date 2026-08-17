@@ -2,15 +2,16 @@ from typing import TYPE_CHECKING, Literal, Optional, Type
 
 import httpx
 from litellm.integrations.custom_guardrail import log_guardrail_information
-from litellm.proxy.guardrails.guardrail_hooks.generic_guardrail_api.generic_guardrail_api import (
-    GenericGuardrailAPI,
-)
-from litellm.secret_managers.main import get_secret_str
-from litellm.types.utils import GenericGuardrailAPIInputs
 from litellm.llms.custom_httpx.http_handler import (
     get_async_httpx_client,
     httpxSpecialProvider,
 )
+from litellm.proxy.guardrails.guardrail_hooks.generic_guardrail_api.generic_guardrail_api import (
+    GenericGuardrailAPI,
+)
+from litellm.secret_managers.main import get_secret_str
+from litellm.types.guardrails import GuardrailEventHooks
+from litellm.types.utils import GenericGuardrailAPIInputs
 
 if TYPE_CHECKING:
     from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
@@ -30,6 +31,9 @@ class ThirdlawGuardrail(GenericGuardrailAPI):
         api_key: Optional[str] = None,
         additional_headers: Optional[str] = None,
         guardrail_timeout: Optional[int] = 60,
+        streaming_buffer_until_moderated: bool = True,
+        streaming_end_of_stream_only: bool = True,
+        streaming_sampling_rate: int = 5,
         **kwargs,
     ):
         resolved_base = api_base or get_secret_str("THIRDLAW_API_BASE")
@@ -49,9 +53,21 @@ class ThirdlawGuardrail(GenericGuardrailAPI):
             h for h in existing if h not in thirdlaw_headers
         ]
         self.guardrail_timeout = httpx.Timeout(timeout=guardrail_timeout, connect=5.0)
+        self.streaming_buffer_until_moderated = streaming_buffer_until_moderated
+        self.streaming_end_of_stream_only = streaming_end_of_stream_only
+        self.streaming_sampling_rate = streaming_sampling_rate
+        if "supported_event_hooks" not in kwargs:
+            kwargs["supported_event_hooks"] = [
+                GuardrailEventHooks.pre_call,
+                GuardrailEventHooks.post_call,
+                GuardrailEventHooks.during_call,
+            ]
         super().__init__(
             api_base=resolved_base,
             api_key=resolved_key,
+            streaming_buffer_until_moderated=streaming_buffer_until_moderated,
+            streaming_end_of_stream_only=streaming_end_of_stream_only,
+            streaming_sampling_rate=streaming_sampling_rate,
             **kwargs,
         )
         self.async_handler = get_async_httpx_client(
