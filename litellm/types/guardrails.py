@@ -60,11 +60,11 @@ from litellm.types.proxy.guardrails.guardrail_hooks.tool_permission import (
 from litellm.types.proxy.guardrails.guardrail_hooks.vigil_guard import (
     VigilGuardGuardrailConfigModel,
 )
-from litellm.types.proxy.guardrails.guardrail_hooks.xecguard import (
-    XecGuardConfigModel,
-)
 from litellm.types.proxy.guardrails.guardrail_hooks.thirdlaw import (
     ThirdlawGuardrailConfigModel,
+)
+from litellm.types.proxy.guardrails.guardrail_hooks.xecguard import (
+    XecGuardConfigModel,
 )
 
 """
