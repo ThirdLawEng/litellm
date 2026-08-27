@@ -1,3 +1,4 @@
+import asyncio
 import json
 from unittest.mock import AsyncMock, patch
 
@@ -12,6 +13,8 @@ from litellm.proxy.guardrails.guardrail_hooks.thirdlaw import (
     initialize_guardrail,
 )
 from litellm.proxy.guardrails.guardrail_hooks.thirdlaw.thirdlaw import (
+    RAW_REQUEST_BODY_PARAM,
+    RAW_RESPONSE_BODY_PARAM,
     ThirdlawGuardrailMissingConfig,
 )
 from litellm.types.guardrails import (
@@ -22,6 +25,7 @@ from litellm.types.guardrails import (
 from litellm.types.proxy.guardrails.guardrail_hooks.thirdlaw import (
     ThirdlawGuardrailConfigModel,
 )
+from litellm.types.utils import Choices, Message, ModelResponse
 
 _ENDPOINT = "https://thirdlaw.test/evaluate"
 
@@ -223,3 +227,130 @@ def test_config_driven_initialization_propagates_streaming_overrides():
     assert cb.streaming_end_of_stream_only is False
     assert cb.streaming_sampling_rate == 10
     assert cb.streaming_buffer_until_moderated is False
+
+
+async def _sent_payload(guardrail: ThirdlawGuardrail, **apply_kwargs) -> dict:
+    mock_post = AsyncMock(return_value=_mock_response({"action": "NONE"}))
+    with patch.object(guardrail.async_handler, "post", mock_post):
+        await guardrail.apply_guardrail(**apply_kwargs)
+    return mock_post.call_args.kwargs["json"]
+
+
+def _chat_request_data() -> dict:
+    body = {
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "hello"}],
+        "temperature": 0.2,
+    }
+    request_data = {**body, "metadata": {"user_api_key": "sk-x"}}
+    request_data["proxy_server_request"] = {"body": request_data, "headers": {}}
+    return request_data
+
+
+async def test_raw_request_body_forwarded_to_guardrail_api():
+    payload = await _sent_payload(
+        _make_guardrail(),
+        inputs={"texts": ["hello"]},
+        request_data=_chat_request_data(),
+        input_type="request",
+    )
+    raw = payload["additional_provider_specific_params"][RAW_REQUEST_BODY_PARAM]
+    assert raw == {
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "hello"}],
+        "temperature": 0.2,
+    }
+    assert RAW_RESPONSE_BODY_PARAM not in payload["additional_provider_specific_params"]
+
+
+async def test_raw_response_body_forwarded_on_post_call():
+    request_data = _chat_request_data()
+    request_data["response"] = ModelResponse(
+        choices=[Choices(message=Message(role="assistant", content="hi there"))],
+        model="gpt-4o",
+    )
+    params = (
+        await _sent_payload(
+            _make_guardrail(),
+            inputs={"texts": ["hi there"]},
+            request_data=request_data,
+            input_type="response",
+        )
+    )["additional_provider_specific_params"]
+    assert params[RAW_RESPONSE_BODY_PARAM]["choices"][0]["message"]["content"] == "hi there"
+    assert params[RAW_REQUEST_BODY_PARAM]["messages"] == [
+        {"role": "user", "content": "hello"}
+    ]
+
+
+async def test_raw_bodies_are_json_serializable_and_not_self_referential():
+    payload = await _sent_payload(
+        _make_guardrail(),
+        inputs={"texts": ["hello"]},
+        request_data=_chat_request_data(),
+        input_type="request",
+    )
+    raw = payload["additional_provider_specific_params"][RAW_REQUEST_BODY_PARAM]
+    assert "proxy_server_request" not in raw
+    assert "metadata" not in raw
+    json.dumps(payload)
+
+
+async def test_non_serializable_values_do_not_break_capture():
+    request_data = _chat_request_data()
+    request_data["proxy_server_request"]["body"]["mock_response"] = object()
+    payload = await _sent_payload(
+        _make_guardrail(),
+        inputs={"texts": ["hello"]},
+        request_data=request_data,
+        input_type="request",
+    )
+    raw = payload["additional_provider_specific_params"][RAW_REQUEST_BODY_PARAM]
+    assert isinstance(raw["mock_response"], str)
+
+
+async def test_no_raw_bodies_when_request_has_no_messages():
+    payload = await _sent_payload(
+        _make_guardrail(),
+        inputs={"texts": ["hello"]},
+        request_data={},
+        input_type="request",
+    )
+    params = payload["additional_provider_specific_params"]
+    assert RAW_REQUEST_BODY_PARAM not in params
+    assert RAW_RESPONSE_BODY_PARAM not in params
+
+
+async def test_raw_bodies_do_not_leak_across_requests():
+    g = _make_guardrail()
+    with_body = await _sent_payload(
+        g,
+        inputs={"texts": ["hello"]},
+        request_data=_chat_request_data(),
+        input_type="request",
+    )
+    assert RAW_REQUEST_BODY_PARAM in with_body["additional_provider_specific_params"]
+
+    without_body = await _sent_payload(
+        g, inputs={"texts": ["hello"]}, request_data={}, input_type="request"
+    )
+    assert RAW_REQUEST_BODY_PARAM not in without_body["additional_provider_specific_params"]
+    assert g.additional_provider_specific_params == {}
+
+
+async def test_concurrent_requests_get_their_own_raw_bodies():
+    g = _make_guardrail()
+
+    async def run(prompt: str) -> dict:
+        request_data = _chat_request_data()
+        request_data["proxy_server_request"]["body"]["messages"] = [
+            {"role": "user", "content": prompt}
+        ]
+        payload = await _sent_payload(
+            g, inputs={"texts": [prompt]}, request_data=request_data, input_type="request"
+        )
+        return payload["additional_provider_specific_params"][RAW_REQUEST_BODY_PARAM]
+
+    first, second = await asyncio.gather(run("alpha"), run("beta"))
+    assert first["messages"][0]["content"] == "alpha"
+    assert second["messages"][0]["content"] == "beta"
