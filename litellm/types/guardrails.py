@@ -60,6 +60,9 @@ from litellm.types.proxy.guardrails.guardrail_hooks.tool_permission import (
 from litellm.types.proxy.guardrails.guardrail_hooks.vigil_guard import (
     VigilGuardGuardrailConfigModel,
 )
+from litellm.types.proxy.guardrails.guardrail_hooks.thirdlaw import (
+    ThirdlawGuardrailConfigModel,
+)
 from litellm.types.proxy.guardrails.guardrail_hooks.xecguard import (
     XecGuardConfigModel,
 )
@@ -132,6 +135,7 @@ class SupportedGuardrailIntegrations(Enum):
     REPELLOAI = "repelloai"
     SINGULR = "singulr"
     HEADROOM = "headroom"
+    THIRDLAW = "thirdlaw"
     COMPRESR = "compresr"
     STRAIKER = "straiker"
 
@@ -998,6 +1002,7 @@ class LitellmParams(
     HiddenlayerGuardrailConfigModel,
     QostodianNexusConfigModel,
     VigilGuardGuardrailConfigModel,
+    ThirdlawGuardrailConfigModel,
     SingulrGuardrailConfigModel,
 ):
     guardrail: str = Field(description="The type of guardrail integration to use")
