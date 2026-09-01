@@ -159,12 +159,17 @@ def _outbound_request_headers(
     request_data: dict[str, object], raw_value_header_names: frozenset[str]
 ) -> dict[str, str] | None:
     """Every inbound header, using LiteLLM's credential-redacted values; names in
-    ``raw_value_header_names`` are substituted with the raw value the client sent."""
+    ``raw_value_header_names`` carry the raw value the client sent.
+
+    The proxy strips the header used for LiteLLM auth (e.g. ``authorization``) from its
+    sanitized copy entirely, so opted-in names are also re-added from the raw headers
+    rather than only substituted in place.
+    """
     redacted: Final = _redacted_inbound_headers(request_data)
     if redacted is None:
         return None
     raw_by_lower: Final = {name.lower(): str(value) for name, value in _raw_inbound_headers(request_data).items()}
-    return {
+    from_redacted: Final = {
         name: (
             raw_by_lower[name.lower()]
             if name.lower() in raw_value_header_names and name.lower() in raw_by_lower
@@ -172,6 +177,13 @@ def _outbound_request_headers(
         )
         for name, value in redacted.items()
     }
+    present_lower: Final = {name.lower() for name in from_redacted}
+    reintroduced: Final = {
+        name: raw_by_lower[name]
+        for name in raw_value_header_names
+        if name in raw_by_lower and name not in present_lower
+    }
+    return {**from_redacted, **reintroduced}
 
 
 def _request_body(request_data: dict[str, object], prefer_snapshot: bool) -> dict[str, object] | None:
@@ -263,9 +275,7 @@ class ThirdlawGuardrail(CustomGuardrail):
 
         configured_names: Final = additional_headers.split(",") if additional_headers else []
         self.raw_value_header_names: frozenset[str] = frozenset(
-            stripped.lower()
-            for name in (*configured_names, *(extra_headers or []))
-            if isinstance(name, str) and (stripped := name.strip())
+            stripped.lower() for name in (*configured_names, *(extra_headers or [])) if (stripped := name.strip())
         )
 
         self.guardrail_timeout = httpx.Timeout(timeout=guardrail_timeout or 60, connect=5.0)

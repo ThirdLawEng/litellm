@@ -98,11 +98,12 @@ def _request_data() -> dict:
             }
         },
     }
+    # The proxy strips the header used for LiteLLM auth (authorization here) from its
+    # sanitized header copy; the raw value survives only in secret_fields.raw_headers.
     data["proxy_server_request"] = {
         "url": "http://localhost:4000/v1/chat/completions",
         "method": "POST",
         "headers": {
-            "authorization": "***REDACTED***",
             "content-type": "application/json",
             "x-request-id": "req-9",
         },
@@ -264,13 +265,13 @@ async def test_pre_call_sends_live_body_not_snapshot():
     assert messages == [{"role": "user", "content": "my api key is sk-user-secret"}]
 
 
-async def test_all_headers_forwarded_with_credentials_redacted_by_default():
+async def test_all_headers_forwarded_without_credentials_by_default():
     g = _make_guardrail(decisions=[_decision_response({"action": "allow"})])
     await _run_pre_call(g, _request_data())
     headers = _sent_payload(g)["request_headers"]
-    assert headers["authorization"] == "***REDACTED***"
     assert headers["content-type"] == "application/json"
     assert headers["x-request-id"] == "req-9"
+    assert "authorization" not in headers
     assert "sk-live-raw" not in json.dumps(_sent_payload(g))
 
 
@@ -283,6 +284,7 @@ async def test_additional_headers_opts_into_raw_values():
     headers = _sent_payload(g)["request_headers"]
     assert headers["authorization"] == "Bearer sk-live-raw"
     assert headers["x-request-id"] == "req-9"
+    assert "x-missing" not in headers
 
 
 async def test_pre_call_block_raises_with_status():
