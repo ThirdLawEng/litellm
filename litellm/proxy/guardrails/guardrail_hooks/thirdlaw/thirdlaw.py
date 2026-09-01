@@ -1,39 +1,75 @@
 import json
-from contextvars import ContextVar
-from typing import TYPE_CHECKING, Any, Callable, Literal, Optional, Type
+import time
+from collections.abc import AsyncGenerator, AsyncIterator
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Final, Literal, cast
 
 import httpx
+from pydantic import ValidationError
+
+import litellm
 from litellm._logging import verbose_proxy_logger
-from litellm.integrations.custom_guardrail import log_guardrail_information
+from litellm._version import version as litellm_version
+from litellm.caching import DualCache
+from litellm.exceptions import GuardrailRaisedException
+from litellm.exceptions import Timeout as LitellmTimeout
+from litellm.integrations.custom_guardrail import (
+    CustomGuardrail,
+    log_guardrail_information,
+)
 from litellm.llms.custom_httpx.http_handler import (
+    AsyncHTTPHandler,
     get_async_httpx_client,
     httpxSpecialProvider,
 )
-from litellm.proxy.guardrails.guardrail_hooks.generic_guardrail_api.generic_guardrail_api import (
-    GenericGuardrailAPI,
+from litellm.proxy._types import UserAPIKeyAuth
+from litellm.proxy.guardrails.anthropic_sse import (
+    anthropic_sse_chunks_from_response,
+    anthropic_sse_error_frames,
+    assemble_anthropic_sse_stream,
+    is_raw_sse_stream,
 )
 from litellm.secret_managers.main import get_secret_str
 from litellm.types.guardrails import GuardrailEventHooks
-from litellm.types.utils import GenericGuardrailAPIInputs
+from litellm.types.proxy.guardrails.guardrail_hooks.thirdlaw import (
+    ThirdlawGuardrailRequest,
+    ThirdlawGuardrailRequestMetadata,
+    ThirdlawGuardrailResponse,
+)
+from litellm.types.utils import (
+    CallTypesLiteral,
+    GuardrailStatus,
+    LLMResponseTypes,
+    ModelResponse,
+    ModelResponseStream,
+)
 
 if TYPE_CHECKING:
-    from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
     from litellm.types.proxy.guardrails.guardrail_hooks.base import GuardrailConfigModel
 
-GUARDRAIL_NAME = "thirdlaw"
+GUARDRAIL_NAME: Final = "thirdlaw"
 
-RAW_REQUEST_BODY_PARAM = "thirdlaw_raw_request_body"
-RAW_RESPONSE_BODY_PARAM = "thirdlaw_raw_response_body"
+_ENDPOINT_PATH: Final = "/guardrails/litellm/v2"
 
-# LiteLLM bookkeeping that rides along in ``request_data`` but is not part of the
-# provider request body. ``proxy_server_request`` in particular holds a shallow
-# copy of the same dict and so is self-referential; serializing it would recurse.
-_NON_BODY_KEYS = frozenset(
+_UNREACHABLE_STATUS_CODES: Final = frozenset({502, 503, 504})
+
+# LiteLLM bookkeeping and transport-credential keys that ride along in ``request_data``
+# but are not part of the provider request body. ``secret_fields`` holds plaintext
+# Authorization values and ``api_key`` can carry a client-forwarded provider key, so
+# neither may leave the proxy; ``proxy_server_request`` is self-referential.
+_BODY_STRIP_KEYS: Final = frozenset(
     {
-        "proxy_server_request",
-        "metadata",
-        "litellm_metadata",
+        "api_key",
+        "guardrail_config",
+        "guardrails",
+        "headers",
+        "litellm_call_id",
         "litellm_logging_obj",
+        "litellm_metadata",
+        "litellm_trace_id",
+        "metadata",
+        "provider_specific_header",
+        "proxy_server_request",
         "response",
         "responses",
         "secret_fields",
@@ -41,159 +77,678 @@ _NON_BODY_KEYS = frozenset(
     }
 )
 
-# Per-request bridge: the parent class builds the outbound payload from
-# ``get_guardrail_dynamic_request_body_params``, which only receives the inbound
-# body, not the full ``request_data`` the raw bodies live in. A ContextVar keeps
-# concurrent requests isolated where instance state would race.
-_RAW_BODIES: ContextVar[dict[str, Any]] = ContextVar("thirdlaw_raw_bodies", default={})
+# Keys a modify_request decision may never write back. Beyond the stripped keys:
+# ``guardrails`` gates which guardrails run, ``model`` was authorized against the
+# key/team before this hook, ``stream`` changes the wire protocol mid-request.
+_WRITE_BACK_DENY_KEYS: Final = _BODY_STRIP_KEYS | frozenset({"model", "policies", "stream", "user"})
+
+_USER_METADATA_FIELDS: Final = (
+    "user_api_key_hash",
+    "user_api_key_alias",
+    "user_api_key_user_id",
+    "user_api_key_user_email",
+    "user_api_key_team_id",
+    "user_api_key_team_alias",
+    "user_api_key_end_user_id",
+    "user_api_key_org_id",
+)
+
+_WireEvent = Literal["pre_call", "during_call", "post_call"]
 
 
-def _jsonable(value: Any) -> Any:
+def _dict_of(value: object) -> dict[str, object] | None:
+    return cast(dict[str, object], value) if isinstance(value, dict) else None
+
+
+def _jsonable_dict(value: dict[str, object]) -> dict[str, object]:
     """Round-trip through JSON so the payload cannot carry live objects."""
-    return json.loads(json.dumps(value, default=str))
+    return cast(dict[str, object], json.loads(json.dumps(value, default=str)))
+
+
+def _merged_request_metadata(request_data: dict[str, object]) -> dict[str, object]:
+    return {
+        **(_dict_of(request_data.get("metadata")) or {}),
+        **(_dict_of(request_data.get("litellm_metadata")) or {}),
+    }
+
+
+def _request_metadata(request_data: dict[str, object]) -> ThirdlawGuardrailRequestMetadata:
+    merged: Final = _merged_request_metadata(request_data)
+    user_fields: Final = {
+        field: value for field in _USER_METADATA_FIELDS if isinstance(value := merged.get(field), str)
+    }
+    token: Final = merged.get("user_api_key_token")
+    hash_fallback: Final = (
+        {"user_api_key_hash": token} if "user_api_key_hash" not in user_fields and isinstance(token, str) else {}
+    )
+    call_id: Final = request_data.get("litellm_call_id")
+    trace_id: Final = request_data.get("litellm_trace_id")
+    model: Final = request_data.get("model")
+    return ThirdlawGuardrailRequestMetadata(
+        litellm_version=litellm_version,
+        litellm_call_id=call_id if isinstance(call_id, str) else None,
+        litellm_trace_id=trace_id if isinstance(trace_id, str) else None,
+        model=model if isinstance(model, str) else None,
+        **user_fields,
+        **hash_fallback,
+    )
+
+
+def _proxy_server_request(request_data: dict[str, object]) -> dict[str, object]:
+    return _dict_of(request_data.get("proxy_server_request")) or {}
+
+
+def _request_url(request_data: dict[str, object]) -> str | None:
+    url: Final = _proxy_server_request(request_data).get("url")
+    return url if isinstance(url, str) else None
+
+
+def _redacted_inbound_headers(request_data: dict[str, object]) -> dict[str, object] | None:
+    proxy_headers: Final = _dict_of(_proxy_server_request(request_data).get("headers"))
+    if proxy_headers:
+        return proxy_headers
+    return _dict_of(_merged_request_metadata(request_data).get("headers")) or None
+
+
+def _raw_inbound_headers(request_data: dict[str, object]) -> dict[str, object]:
+    secret_fields: Final = _dict_of(request_data.get("secret_fields")) or {}
+    return _dict_of(secret_fields.get("raw_headers")) or {}
+
+
+def _outbound_request_headers(
+    request_data: dict[str, object], raw_value_header_names: frozenset[str]
+) -> dict[str, str] | None:
+    """Every inbound header, using LiteLLM's credential-redacted values; names in
+    ``raw_value_header_names`` are substituted with the raw value the client sent."""
+    redacted: Final = _redacted_inbound_headers(request_data)
+    if redacted is None:
+        return None
+    raw_by_lower: Final = {name.lower(): str(value) for name, value in _raw_inbound_headers(request_data).items()}
+    return {
+        name: (
+            raw_by_lower[name.lower()]
+            if name.lower() in raw_value_header_names and name.lower() in raw_by_lower
+            else str(value)
+        )
+        for name, value in redacted.items()
+    }
+
+
+def _request_body(request_data: dict[str, object], prefer_snapshot: bool) -> dict[str, object] | None:
+    """Best-effort provider request body; never raises because a guardrail that throws
+    here would fail live traffic.
+
+    Pre-call must read live ``request_data``: the ``proxy_server_request.body`` snapshot
+    is taken before pre-call hooks run, so it would resend content an earlier guardrail
+    (e.g. Presidio masking) already rewrote.
+    """
+    snapshot: Final = _dict_of(_proxy_server_request(request_data).get("body")) if prefer_snapshot else None
+    source: Final = snapshot if snapshot is not None else request_data
+    try:
+        return _jsonable_dict({key: value for key, value in source.items() if key not in _BODY_STRIP_KEYS})
+    except Exception:
+        verbose_proxy_logger.warning("ThirdLaw guardrail: could not serialize request body", exc_info=True)
+        return None
+
+
+def _response_payload(response: object) -> dict[str, object] | None:
+    dump: Final = getattr(response, "model_dump", None)
+    try:
+        raw: Final[object] = dump(mode="json") if callable(dump) else response
+    except Exception:
+        verbose_proxy_logger.warning("ThirdLaw guardrail: could not serialize response body", exc_info=True)
+        return None
+    as_dict: Final = _dict_of(raw)
+    if as_dict is None:
+        return None
+    try:
+        return _jsonable_dict(as_dict)
+    except Exception:
+        verbose_proxy_logger.warning("ThirdLaw guardrail: could not serialize response body", exc_info=True)
+        return None
+
+
+def _is_unreachable_error(error: Exception) -> bool:
+    if isinstance(error, httpx.HTTPStatusError):
+        return error.response.status_code in _UNREACHABLE_STATUS_CODES
+    return isinstance(error, (httpx.RequestError, LitellmTimeout))
+
+
+def _decision_trace(decision: ThirdlawGuardrailResponse) -> dict[str, object]:
+    return {
+        "action": decision.action,
+        "message": decision.message,
+        "response_status": decision.response_status,
+        "modified_request": decision.request_body is not None,
+        "modified_response": decision.response_body is not None,
+    }
 
 
 class ThirdlawGuardrailMissingConfig(ValueError):
     pass
 
 
-class ThirdlawGuardrail(GenericGuardrailAPI):
+class ThirdlawGuardrail(CustomGuardrail):
     def __init__(
         self,
-        api_base: Optional[str] = None,
-        api_key: Optional[str] = None,
-        additional_headers: Optional[str] = None,
-        guardrail_timeout: Optional[int] = 60,
+        api_base: str | None = None,
+        api_key: str | None = None,
+        additional_headers: str | None = None,
+        guardrail_timeout: int | None = 60,
         streaming_buffer_until_moderated: bool = True,
         streaming_end_of_stream_only: bool = True,
         streaming_sampling_rate: int = 5,
+        unreachable_fallback: Literal["fail_closed", "fail_open"] = "fail_closed",
+        additional_provider_specific_params: dict[str, object] | None = None,
+        headers: dict[str, str] | None = None,
+        extra_headers: list[str] | None = None,
+        async_handler: AsyncHTTPHandler | None = None,
         **kwargs,
     ):
-        resolved_base = api_base or get_secret_str("THIRDLAW_API_BASE")
+        resolved_base: Final = api_base or get_secret_str("THIRDLAW_API_BASE")
         if not resolved_base:
             raise ThirdlawGuardrailMissingConfig(
                 "ThirdLaw api_base is required. Set api_base in the guardrail "
                 "config or the THIRDLAW_API_BASE environment variable."
             )
-        resolved_key = api_key or get_secret_str("THIRDLAW_API_KEY")
-        thirdlaw_headers = []
-        if additional_headers:
-            thirdlaw_headers.extend(
-                [h.strip() for h in additional_headers.split(",") if h.strip()]
-            )
-        existing = kwargs.get("extra_headers") or []
-        kwargs["extra_headers"] = thirdlaw_headers + [
-            h for h in existing if h not in thirdlaw_headers
-        ]
-        self.guardrail_timeout = httpx.Timeout(timeout=guardrail_timeout, connect=5.0)
+        if streaming_sampling_rate < 1:
+            raise ValueError(f"streaming_sampling_rate must be >= 1 (got {streaming_sampling_rate})")
+
+        trimmed_base: Final = resolved_base.rstrip("/")
+        self.api_base = trimmed_base if trimmed_base.endswith(_ENDPOINT_PATH) else f"{trimmed_base}{_ENDPOINT_PATH}"
+
+        resolved_key: Final = api_key or get_secret_str("THIRDLAW_API_KEY")
+        auth_header: Final = {"Authorization": f"Bearer {resolved_key}"} if resolved_key else {}
+        self.http_headers: dict[str, str] = {"Content-Type": "application/json", **(headers or {}), **auth_header}
+
+        configured_names: Final = additional_headers.split(",") if additional_headers else []
+        self.raw_value_header_names: frozenset[str] = frozenset(
+            stripped.lower()
+            for name in (*configured_names, *(extra_headers or []))
+            if isinstance(name, str) and (stripped := name.strip())
+        )
+
+        self.guardrail_timeout = httpx.Timeout(timeout=guardrail_timeout or 60, connect=5.0)
         self.streaming_buffer_until_moderated = streaming_buffer_until_moderated
         self.streaming_end_of_stream_only = streaming_end_of_stream_only
         self.streaming_sampling_rate = streaming_sampling_rate
-        if "supported_event_hooks" not in kwargs:
-            kwargs["supported_event_hooks"] = [
-                GuardrailEventHooks.pre_call,
-                GuardrailEventHooks.post_call,
-                GuardrailEventHooks.during_call,
-            ]
-        super().__init__(
-            api_base=resolved_base,
-            api_key=resolved_key,
-            streaming_buffer_until_moderated=streaming_buffer_until_moderated,
-            streaming_end_of_stream_only=streaming_end_of_stream_only,
-            streaming_sampling_rate=streaming_sampling_rate,
-            **kwargs,
-        )
-        self.async_handler = get_async_httpx_client(
+        self.unreachable_fallback: Literal["fail_closed", "fail_open"] = unreachable_fallback
+        self.additional_provider_specific_params: dict[str, object] = additional_provider_specific_params or {}
+
+        kwargs.setdefault("supported_event_hooks", list(self.get_supported_event_hooks()))
+        super().__init__(**kwargs)
+
+        self.async_handler = async_handler or get_async_httpx_client(
             llm_provider=httpxSpecialProvider.GuardrailCallback,
             params={"timeout": self.guardrail_timeout},
         )
 
-    @log_guardrail_information
-    async def apply_guardrail(
-        self,
-        inputs: GenericGuardrailAPIInputs,
-        request_data: dict,
-        input_type: Literal["request", "response"],
-        logging_obj: Optional["LiteLLMLoggingObj"] = None,
-    ) -> GenericGuardrailAPIInputs:
-        inputs["structured_messages"] = (
-            inputs.get("structured_messages", request_data.get("messages", [])) or []
-        )
-        token = _RAW_BODIES.set(self._capture(request_data))
-        try:
-            return await super().apply_guardrail(
-                inputs=inputs,
-                request_data=request_data,
-                input_type=input_type,
-                logging_obj=logging_obj,
-            )
-        finally:
-            _RAW_BODIES.reset(token)
-
-    def get_guardrail_dynamic_request_body_params(self, request_data: dict) -> dict:
-        return {
-            **super().get_guardrail_dynamic_request_body_params(request_data),
-            **_RAW_BODIES.get(),
-        }
-
-    def _capture(self, request_data: Optional[dict]) -> dict[str, Any]:
-        """Best-effort extraction of the raw bodies.
-
-        Never raises: a guardrail that throws here would fail live traffic, and a
-        missing raw body only costs fidelity because intervene-service still
-        synthesizes one.
-        """
-        if not isinstance(request_data, dict):
-            return {}
-        return {
-            **self._capture_one(RAW_REQUEST_BODY_PARAM, self._request_body, request_data),
-            **self._capture_one(RAW_RESPONSE_BODY_PARAM, self._response_body, request_data),
-        }
+    @classmethod
+    def get_supported_event_hooks(cls) -> list[GuardrailEventHooks]:
+        return [
+            GuardrailEventHooks.pre_call,
+            GuardrailEventHooks.post_call,
+            GuardrailEventHooks.during_call,
+        ]
 
     @staticmethod
-    def _capture_one(
-        param: str,
-        extract: Callable[[dict], Optional[dict]],
-        request_data: dict,
-    ) -> dict[str, Any]:
-        try:
-            body = extract(request_data)
-        except Exception:
-            verbose_proxy_logger.warning(
-                "ThirdLaw guardrail: could not capture %s", param, exc_info=True
-            )
-            return {}
-        return {param: _jsonable(body)} if body else {}
-
-    @staticmethod
-    def _request_body(request_data: dict) -> Optional[dict]:
-        """The outbound chat-completions body.
-
-        ``proxy_server_request.body`` is LiteLLM's own snapshot, but it is a
-        shallow copy of ``request_data`` taken after the snapshot key already
-        existed, so it points back at itself. Strip the bookkeeping keys from
-        either source before use.
-        """
-        proxy_request = request_data.get("proxy_server_request")
-        snapshot = proxy_request.get("body") if isinstance(proxy_request, dict) else None
-        source = snapshot if isinstance(snapshot, dict) else request_data
-        body = {k: v for k, v in source.items() if k not in _NON_BODY_KEYS}
-        return body if body.get("messages") else None
-
-    @staticmethod
-    def _response_body(request_data: dict) -> Optional[dict]:
-        """The provider response, present only on the post-call hook."""
-        response = request_data.get("response")
-        if response is None:
-            return None
-        dump = getattr(response, "model_dump", None)
-        body = dump(mode="json") if callable(dump) else response
-        return body if isinstance(body, dict) and body.get("choices") else None
-
-    @staticmethod
-    def get_config_model() -> Optional[Type["GuardrailConfigModel"]]:
+    def get_config_model() -> type["GuardrailConfigModel"] | None:
         from litellm.types.proxy.guardrails.guardrail_hooks.thirdlaw import (
             ThirdlawGuardrailConfigModel,
         )
 
         return ThirdlawGuardrailConfigModel
+
+    def _build_wire_request(
+        self,
+        *,
+        wire_event: _WireEvent,
+        request_data: dict[str, object],
+        response_body: dict[str, object] | None,
+    ) -> ThirdlawGuardrailRequest:
+        dynamic_params: Final = cast(dict[str, object], self.get_guardrail_dynamic_request_body_params(request_data))
+        combined_params: Final = {**self.additional_provider_specific_params, **dynamic_params}
+        return ThirdlawGuardrailRequest(
+            event_type=wire_event,
+            metadata=_request_metadata(request_data),
+            request_url=_request_url(request_data),
+            request_headers=_outbound_request_headers(request_data, self.raw_value_header_names),
+            request_body=_request_body(request_data, prefer_snapshot=wire_event != "pre_call"),
+            response_body=response_body,
+            additional_provider_specific_params=combined_params or None,
+        )
+
+    def _record_trace(
+        self,
+        *,
+        request_data: dict[str, object],
+        event_type: GuardrailEventHooks,
+        status: GuardrailStatus,
+        started_at: datetime,
+        trace: dict[str, object],
+    ) -> None:
+        now: Final = datetime.now(timezone.utc)
+        self.add_standard_logging_guardrail_information_to_request_data(
+            guardrail_json_response=trace,
+            request_data=request_data,
+            guardrail_status=status,
+            start_time=started_at.timestamp(),
+            end_time=now.timestamp(),
+            duration=(now - started_at).total_seconds(),
+            event_type=event_type,
+        )
+
+    def _handle_call_failure(self, *, error: Exception, wire_event: _WireEvent) -> None:
+        """Fail-open logs and returns; everything else raises."""
+        if _is_unreachable_error(error) and self.unreachable_fallback == "fail_open":
+            verbose_proxy_logger.critical(
+                "ThirdLaw guardrail unreachable (fail-open). Proceeding without guardrail. "
+                "guardrail_name=%s api_base=%s event=%s",
+                self.guardrail_name,
+                self.api_base,
+                wire_event,
+                exc_info=error,
+            )
+            return
+        raise GuardrailRaisedException(
+            guardrail_name=self.guardrail_name,
+            message=f"ThirdLaw guardrail request failed: {error}",
+        ) from error
+
+    async def _run_thirdlaw(
+        self,
+        *,
+        event_type: GuardrailEventHooks,
+        wire_event: _WireEvent,
+        request_data: dict[str, object],
+        response_body: dict[str, object] | None = None,
+    ) -> ThirdlawGuardrailResponse | None:
+        """POST the full payload to ThirdLaw and return its decision.
+
+        Returns None when the service is unreachable and the guardrail is configured
+        fail-open; raises for every other failure and records the guardrail trace on
+        all paths (the decorator on the lifecycle hooks skips its auto-record when an
+        entry was already written here).
+        """
+        started_at: Final = datetime.now(timezone.utc)
+        payload: Final = self._build_wire_request(
+            wire_event=wire_event, request_data=request_data, response_body=response_body
+        )
+        try:
+            http_response: Final = await self.async_handler.post(
+                url=self.api_base,
+                headers=self.http_headers,
+                json=payload.model_dump(mode="json", exclude_none=True),
+            )
+            if http_response is None:
+                raise ValueError("ThirdLaw guardrail HTTP client returned no response")
+            http_response.raise_for_status()
+            decision: Final = ThirdlawGuardrailResponse.model_validate(http_response.json())
+        except Exception as error:
+            self._record_trace(
+                request_data=request_data,
+                event_type=event_type,
+                status="guardrail_failed_to_respond",
+                started_at=started_at,
+                trace={"error": str(error)},
+            )
+            self._handle_call_failure(error=error, wire_event=wire_event)
+            return None
+        status: Final[GuardrailStatus] = "guardrail_intervened" if decision.action == "block" else "success"
+        self._record_trace(
+            request_data=request_data,
+            event_type=event_type,
+            status=status,
+            started_at=started_at,
+            trace=_decision_trace(decision),
+        )
+        return decision
+
+    def _block_exception(self, decision: ThirdlawGuardrailResponse) -> GuardrailRaisedException:
+        return GuardrailRaisedException(
+            guardrail_name=self.guardrail_name,
+            message=decision.message or "Content violates ThirdLaw policy",
+            should_wrap_with_default_message=False,
+            status_code=decision.response_status or 400,
+            blocked_content=True,
+        )
+
+    def _applied_request_modifications(
+        self, *, data: dict[str, object], decision: ThirdlawGuardrailResponse
+    ) -> dict[str, object]:
+        replacement: Final = decision.request_body
+        if not replacement:
+            verbose_proxy_logger.warning(
+                "ThirdLaw guardrail: modify_request decision carried no request_body; request unchanged"
+            )
+            return data
+        accepted: Final = {key: value for key, value in replacement.items() if key not in _WRITE_BACK_DENY_KEYS}
+        denied: Final = replacement.keys() - accepted.keys()
+        if denied:
+            verbose_proxy_logger.warning(
+                "ThirdLaw guardrail: dropping protected keys from modify_request write-back: %s",
+                sorted(denied),
+            )
+        if not accepted:
+            return data
+        return {**data, **accepted}
+
+    def _modified_response(self, *, response: object, replacement: dict[str, object]) -> object:
+        if isinstance(response, ModelResponse):
+            # ModelResponse validation coerces a non-list ``choices`` into a single
+            # empty choice instead of raising, which would silently blank the response.
+            if "choices" in replacement and not isinstance(replacement.get("choices"), list):
+                raise GuardrailRaisedException(
+                    guardrail_name=self.guardrail_name,
+                    message="ThirdLaw guardrail returned a malformed modified response: choices must be a list",
+                )
+            merged: Final = {**cast(dict[str, object], response.model_dump()), **replacement}
+            try:
+                return cast(ModelResponse, ModelResponse.model_validate(merged))
+            except ValidationError as error:
+                raise GuardrailRaisedException(
+                    guardrail_name=self.guardrail_name,
+                    message=f"ThirdLaw guardrail returned a malformed modified response: {error}",
+                ) from error
+        response_dict: Final = _dict_of(response)
+        if response_dict is not None:
+            return {**response_dict, **replacement}
+        verbose_proxy_logger.warning(
+            "ThirdLaw guardrail: modify_response is not supported for %s responses; returning original",
+            type(response).__name__,
+        )
+        return response
+
+    def _mark_applied(self, request_data: dict[str, object]) -> None:
+        from litellm.proxy.common_utils.callback_utils import (
+            add_guardrail_to_applied_guardrails_header,
+        )
+
+        add_guardrail_to_applied_guardrails_header(request_data=request_data, guardrail_name=self.guardrail_name)
+
+    @log_guardrail_information
+    async def async_pre_call_hook(
+        self,
+        user_api_key_dict: UserAPIKeyAuth,
+        cache: DualCache,
+        data: dict[str, object],
+        call_type: CallTypesLiteral,
+    ) -> dict[str, object]:
+        decision: Final = await self._run_thirdlaw(
+            event_type=GuardrailEventHooks.pre_call, wire_event="pre_call", request_data=data
+        )
+        if decision is None:
+            return data
+        if decision.action == "block":
+            raise self._block_exception(decision)
+        self._mark_applied(data)
+        if decision.action == "modify_request":
+            return self._applied_request_modifications(data=data, decision=decision)
+        if decision.action == "modify_response":
+            verbose_proxy_logger.warning("ThirdLaw guardrail: ignoring modify_response decision on pre_call")
+        return data
+
+    @log_guardrail_information
+    async def async_moderation_hook(
+        self,
+        data: dict[str, object],
+        user_api_key_dict: UserAPIKeyAuth,
+        call_type: CallTypesLiteral,
+    ) -> dict[str, object]:
+        decision: Final = await self._run_thirdlaw(
+            event_type=GuardrailEventHooks.during_call, wire_event="during_call", request_data=data
+        )
+        if decision is None:
+            return data
+        if decision.action == "block":
+            raise self._block_exception(decision)
+        if decision.action != "allow":
+            verbose_proxy_logger.warning(
+                "ThirdLaw guardrail: %s decision cannot be applied on during_call (runs parallel to the LLM call)",
+                decision.action,
+            )
+        self._mark_applied(data)
+        return data
+
+    @log_guardrail_information
+    async def async_post_call_success_hook(
+        self,
+        data: dict[str, object],
+        user_api_key_dict: UserAPIKeyAuth,
+        response: LLMResponseTypes,
+    ) -> LLMResponseTypes:
+        response_body: Final = _response_payload(response)
+        if response_body is None:
+            verbose_proxy_logger.warning(
+                "ThirdLaw guardrail: skipping post_call scan for unsupported response type %s",
+                str(type(response).__name__),
+            )
+            return response
+        decision: Final = await self._run_thirdlaw(
+            event_type=GuardrailEventHooks.post_call,
+            wire_event="post_call",
+            request_data=data,
+            response_body=response_body,
+        )
+        if decision is None:
+            return response
+        if decision.action == "block":
+            raise self._block_exception(decision)
+        self._mark_applied(data)
+        if decision.action != "modify_response" or not decision.response_body:
+            return response
+        if self.run_in_parallel:
+            verbose_proxy_logger.warning(
+                "ThirdLaw guardrail: modify_response is discarded when run_in_parallel=True (block-only mode)"
+            )
+        modified: Final = self._modified_response(response=response, replacement=decision.response_body)
+        return cast(LLMResponseTypes, modified)
+
+    async def async_post_call_streaming_iterator_hook(
+        self,
+        user_api_key_dict: UserAPIKeyAuth,
+        response: AsyncIterator[object],
+        request_data: dict[str, object],
+    ) -> AsyncGenerator[ModelResponseStream, None]:
+        end_of_stream_only: Final = self.streaming_buffer_until_moderated or self.streaming_end_of_stream_only
+        iterator: Final = (
+            self._end_of_stream_moderated_stream(
+                response=response, request_data=request_data, buffer=self.streaming_buffer_until_moderated
+            )
+            if end_of_stream_only
+            else self._sampled_stream(response=response, request_data=request_data)
+        )
+        async for item in iterator:
+            # Raw-SSE frames (bytes) ride through the same pipe; the proxy's data
+            # generator forwards str/bytes chunks verbatim, matching bedrock's hook.
+            yield cast(ModelResponseStream, item)
+
+    @staticmethod
+    def _assembled_stream_response(collected: list[object], raw_sse: bool) -> ModelResponse | None:
+        if raw_sse:
+            return assemble_anthropic_sse_stream(collected, restore_identity=True)
+        from litellm.main import stream_chunk_builder
+
+        try:
+            assembled: Final = stream_chunk_builder(chunks=collected)
+        except Exception:
+            verbose_proxy_logger.warning("ThirdLaw guardrail: could not assemble streamed response", exc_info=True)
+            return None
+        return assembled if isinstance(assembled, ModelResponse) else None
+
+    def _streaming_block_error(self, message: str) -> Exception:
+        from litellm.proxy.proxy_server import StreamingCallbackError
+
+        return StreamingCallbackError(message)
+
+    async def _end_of_stream_moderated_stream(
+        self,
+        *,
+        response: AsyncIterator[object],
+        request_data: dict[str, object],
+        buffer: bool,
+    ) -> AsyncGenerator[object, None]:
+        started: Final = time.monotonic()
+        collected: Final[list[object]] = []
+        async for item in response:
+            collected.append(item)
+            if not buffer:
+                yield item
+
+        raw_sse: Final = is_raw_sse_stream(collected)
+        assembled: Final = self._assembled_stream_response(collected, raw_sse)
+        if assembled is None:
+            async for item in self._handle_unassembleable(collected=collected, raw_sse=raw_sse, buffer=buffer):
+                yield item
+            return
+
+        try:
+            decision = await self._run_thirdlaw(
+                event_type=GuardrailEventHooks.post_call,
+                wire_event="post_call",
+                request_data=request_data,
+                response_body=_response_payload(assembled),
+            )
+        except Exception as error:
+            if raw_sse and self._sse_headers_flushed(started):
+                for frame in anthropic_sse_error_frames(f"ThirdLaw guardrail request failed: {error}"):
+                    yield frame
+                return
+            raise
+
+        if decision is None or decision.action in ("allow", "modify_request"):
+            if decision is not None and decision.action == "modify_request":
+                verbose_proxy_logger.warning("ThirdLaw guardrail: ignoring modify_request decision on a stream")
+            if buffer:
+                for item in collected:
+                    yield item
+            return
+
+        if decision.action == "block":
+            # A raw-SSE block always travels as an Anthropic error frame: a raised
+            # exception is serialized as an OpenAI-shape error blob the Anthropic SDK
+            # cannot parse.
+            if raw_sse:
+                for frame in anthropic_sse_error_frames(decision.message or "Content violates ThirdLaw policy"):
+                    yield frame
+                return
+            raise self._streaming_block_error(decision.message or "Content violates ThirdLaw policy")
+
+        if not buffer:
+            verbose_proxy_logger.warning(
+                "ThirdLaw guardrail: modify_response arrived after chunks were already delivered "
+                "(streaming_buffer_until_moderated=False); response not modified"
+            )
+            return
+        if not decision.response_body:
+            for item in collected:
+                yield item
+            return
+        async for item in self._emit_modified_stream(
+            assembled=assembled, replacement=decision.response_body, raw_sse=raw_sse
+        ):
+            yield item
+
+    async def _handle_unassembleable(
+        self,
+        *,
+        collected: list[object],
+        raw_sse: bool,
+        buffer: bool,
+    ) -> AsyncGenerator[object, None]:
+        """Fail closed for scannable stream shapes; pass through the rest.
+
+        A blanket fail-closed would break /v1/responses and text-completion streams
+        (which assemble to non-ModelResponse shapes) for default_on deployments.
+        """
+        if raw_sse:
+            for frame in anthropic_sse_error_frames(
+                f"{self.guardrail_name}: streamed response could not be assembled for scanning, blocking it"
+            ):
+                yield frame
+            return
+        if any(isinstance(item, ModelResponseStream) for item in collected):
+            raise self._streaming_block_error(
+                f"{self.guardrail_name}: streamed response could not be assembled for scanning, blocking it"
+            )
+        verbose_proxy_logger.warning("ThirdLaw guardrail: unsupported stream shape; passing through without scanning")
+        if buffer:
+            for item in collected:
+                yield item
+
+    async def _emit_modified_stream(
+        self,
+        *,
+        assembled: ModelResponse,
+        replacement: dict[str, object],
+        raw_sse: bool,
+    ) -> AsyncGenerator[object, None]:
+        modified: Final = self._modified_response(response=assembled, replacement=replacement)
+        if not isinstance(modified, ModelResponse):
+            raise self._streaming_block_error(f"{self.guardrail_name}: modified streamed response failed validation")
+        if raw_sse:
+            for frame in anthropic_sse_chunks_from_response(modified):
+                yield frame
+            return
+        from litellm.llms.base_llm.base_model_iterator import MockResponseIterator
+
+        async for chunk in MockResponseIterator(model_response=modified):
+            yield chunk
+
+    async def _sampled_stream(
+        self,
+        *,
+        response: AsyncIterator[object],
+        request_data: dict[str, object],
+    ) -> AsyncGenerator[object, None]:
+        collected: Final[list[object]] = []
+        async for item in response:
+            collected.append(item)
+            yield item
+            if len(collected) % self.streaming_sampling_rate != 0 or is_raw_sse_stream(collected):
+                continue
+            interim = self._assembled_stream_response(collected, raw_sse=False)
+            if interim is None:
+                continue
+            interim_decision = await self._run_thirdlaw(
+                event_type=GuardrailEventHooks.post_call,
+                wire_event="post_call",
+                request_data=request_data,
+                response_body=_response_payload(interim),
+            )
+            if interim_decision is not None and interim_decision.action == "block":
+                raise self._streaming_block_error(interim_decision.message or "Content violates ThirdLaw policy")
+
+        raw_sse: Final = is_raw_sse_stream(collected)
+        assembled: Final = self._assembled_stream_response(collected, raw_sse)
+        if assembled is None:
+            async for item in self._handle_unassembleable(collected=collected, raw_sse=raw_sse, buffer=False):
+                yield item
+            return
+        final_decision: Final = await self._run_thirdlaw(
+            event_type=GuardrailEventHooks.post_call,
+            wire_event="post_call",
+            request_data=request_data,
+            response_body=_response_payload(assembled),
+        )
+        if final_decision is None:
+            return
+        if final_decision.action == "block":
+            if raw_sse:
+                for frame in anthropic_sse_error_frames(final_decision.message or "Content violates ThirdLaw policy"):
+                    yield frame
+                return
+            raise self._streaming_block_error(final_decision.message or "Content violates ThirdLaw policy")
+        if final_decision.action == "modify_response":
+            verbose_proxy_logger.warning(
+                "ThirdLaw guardrail: modify_response arrived after chunks were already delivered "
+                "(streaming_end_of_stream_only=False); response not modified"
+            )
+
+    @staticmethod
+    def _sse_headers_flushed(started_monotonic: float) -> bool:
+        from litellm.proxy.common_utils.sse_keepalive import keepalive_ping_has_fired
+
+        return keepalive_ping_has_fired(
+            time.monotonic() - started_monotonic, litellm.anthropic_sse_ping_interval_seconds
+        )

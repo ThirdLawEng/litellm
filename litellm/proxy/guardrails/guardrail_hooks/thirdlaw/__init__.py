@@ -11,23 +11,19 @@ if TYPE_CHECKING:
 def initialize_guardrail(litellm_params: "LitellmParams", guardrail: "Guardrail"):
     import litellm
 
+    # LitellmParams' multiple-inheritance MRO resolves guardrail_timeout to a
+    # None default, so the 60s fallback must be applied here.
     _thirdlaw_callback = ThirdlawGuardrail(
         api_base=litellm_params.api_base,
         api_key=litellm_params.api_key,
-        headers=getattr(litellm_params, "headers", None),
-        guardrail_timeout=getattr(litellm_params, "guardrail_timeout", 60),
         additional_headers=getattr(litellm_params, "additional_headers", None),
-        additional_provider_specific_params=getattr(
-            litellm_params, "additional_provider_specific_params", {}
-        ),
-        unreachable_fallback=getattr(
-            litellm_params, "unreachable_fallback", "fail_closed"
-        ),
-        streaming_end_of_stream_only=getattr(
-            litellm_params, "streaming_end_of_stream_only", True
-        ),
-        streaming_sampling_rate=getattr(litellm_params, "streaming_sampling_rate", 5),
+        guardrail_timeout=getattr(litellm_params, "guardrail_timeout", None) or 60,
         streaming_buffer_until_moderated=getattr(litellm_params, "streaming_buffer_until_moderated", True),
+        streaming_end_of_stream_only=getattr(litellm_params, "streaming_end_of_stream_only", True),
+        streaming_sampling_rate=getattr(litellm_params, "streaming_sampling_rate", 5),
+        unreachable_fallback=getattr(litellm_params, "unreachable_fallback", None) or "fail_closed",
+        additional_provider_specific_params=getattr(litellm_params, "additional_provider_specific_params", None),
+        headers=getattr(litellm_params, "headers", None),
         extra_headers=getattr(litellm_params, "extra_headers", None),
         guardrail_name=guardrail.get("guardrail_name", ""),
         event_hook=litellm_params.mode,
