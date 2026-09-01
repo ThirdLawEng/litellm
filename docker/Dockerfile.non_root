@@ -6,7 +6,11 @@ ARG LITELLM_RUNTIME_IMAGE=cgr.dev/chainguard/wolfi-base@sha256:a31344ab2cb8618db
 ARG PROXY_EXTRAS_SOURCE=published
 ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.11.7@sha256:240fb85ab0f263ef12f492d8476aa3a2e4e1e333f7d67fbdd923d00a506a516a
 # Pinned by digest like the other base images; bump explicitly on Node upgrades.
-ARG UI_BUILD_IMAGE=node:24.19-alpine3.24@sha256:d32cdf619f63fe0471182d08996dd516c6275bb5fd31ae06e55a570bd9e1ad43
+# Debian (glibc) rather than alpine: on musl builders, environments that force
+# npm_config_libc=glibc (a common CI/cross-build setting) make npm install the
+# gnu swc binding and skip the musl one, so `next build` dies with
+# "__res_init: symbol not found" and a Turbopack-unsupported WASM fallback.
+ARG UI_BUILD_IMAGE=node:24.19-bookworm-slim@sha256:a9f5f7c91a432850b2a8a7797adf5eadb6c733ceed61167806cee7ea7fbc29df
 
 FROM $UV_IMAGE AS uvbin
 
