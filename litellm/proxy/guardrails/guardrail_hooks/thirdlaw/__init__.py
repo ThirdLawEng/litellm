@@ -1,4 +1,3 @@
-from types import MappingProxyType
 from typing import TYPE_CHECKING, Final
 
 from litellm.types.guardrails import SupportedGuardrailIntegrations
@@ -34,8 +33,10 @@ def initialize_guardrail(litellm_params: "LitellmParams", guardrail: "Guardrail"
     return _thirdlaw_callback
 
 
-guardrail_initializer_registry: Final = MappingProxyType(
-    {SupportedGuardrailIntegrations.THIRDLAW.value: initialize_guardrail}
-)
+guardrail_initializer_registry: Final = {  # mutable-ok: the registry loader requires a plain dict
+    SupportedGuardrailIntegrations.THIRDLAW.value: initialize_guardrail,
+}
 
-guardrail_class_registry: Final = MappingProxyType({SupportedGuardrailIntegrations.THIRDLAW.value: ThirdlawGuardrail})
+guardrail_class_registry: Final = {  # mutable-ok: the registry loader requires a plain dict
+    SupportedGuardrailIntegrations.THIRDLAW.value: ThirdlawGuardrail,
+}

@@ -197,6 +197,8 @@ def test_config_model_ui_name():
 
 
 def test_registries_expose_initializer_and_class():
+    assert isinstance(guardrail_initializer_registry, dict)
+    assert isinstance(guardrail_class_registry, dict)
     assert "thirdlaw" in guardrail_initializer_registry
     assert guardrail_class_registry["thirdlaw"] is ThirdlawGuardrail
 
