@@ -54,14 +54,14 @@ from litellm.types.proxy.guardrails.guardrail_hooks.repelloai import (
 from litellm.types.proxy.guardrails.guardrail_hooks.singulr import (
     SingulrGuardrailConfigModel,
 )
+from litellm.types.proxy.guardrails.guardrail_hooks.thirdlaw import (
+    ThirdlawGuardrailConfigModel,
+)
 from litellm.types.proxy.guardrails.guardrail_hooks.tool_permission import (
     ToolPermissionGuardrailConfigModel,
 )
 from litellm.types.proxy.guardrails.guardrail_hooks.vigil_guard import (
     VigilGuardGuardrailConfigModel,
-)
-from litellm.types.proxy.guardrails.guardrail_hooks.thirdlaw import (
-    ThirdlawGuardrailConfigModel,
 )
 from litellm.types.proxy.guardrails.guardrail_hooks.xecguard import (
     XecGuardConfigModel,
