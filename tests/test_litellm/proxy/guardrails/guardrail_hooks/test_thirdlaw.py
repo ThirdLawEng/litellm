@@ -179,7 +179,7 @@ def test_default_supported_event_hooks():
 
 
 def test_invalid_sampling_rate_rejected():
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="streaming_sampling_rate"):
         _make_guardrail(streaming_sampling_rate=0)
 
 

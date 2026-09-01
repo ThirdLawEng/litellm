@@ -1,4 +1,5 @@
-from typing import TYPE_CHECKING
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Final
 
 from litellm.types.guardrails import SupportedGuardrailIntegrations
 
@@ -13,7 +14,7 @@ def initialize_guardrail(litellm_params: "LitellmParams", guardrail: "Guardrail"
 
     # LitellmParams' multiple-inheritance MRO resolves guardrail_timeout to a
     # None default, so the 60s fallback must be applied here.
-    _thirdlaw_callback = ThirdlawGuardrail(
+    _thirdlaw_callback: Final = ThirdlawGuardrail(
         api_base=litellm_params.api_base,
         api_key=litellm_params.api_key,
         additional_headers=getattr(litellm_params, "additional_headers", None),
@@ -33,10 +34,8 @@ def initialize_guardrail(litellm_params: "LitellmParams", guardrail: "Guardrail"
     return _thirdlaw_callback
 
 
-guardrail_initializer_registry = {
-    SupportedGuardrailIntegrations.THIRDLAW.value: initialize_guardrail,
-}
+guardrail_initializer_registry: Final = MappingProxyType(
+    {SupportedGuardrailIntegrations.THIRDLAW.value: initialize_guardrail}
+)
 
-guardrail_class_registry = {
-    SupportedGuardrailIntegrations.THIRDLAW.value: ThirdlawGuardrail,
-}
+guardrail_class_registry: Final = MappingProxyType({SupportedGuardrailIntegrations.THIRDLAW.value: ThirdlawGuardrail})

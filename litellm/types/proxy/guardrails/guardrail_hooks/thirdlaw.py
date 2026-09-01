@@ -1,3 +1,4 @@
+from collections.abc import Mapping
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -32,10 +33,10 @@ class ThirdlawGuardrailRequest(BaseModel):
     event_type: Literal["pre_call", "during_call", "post_call"]
     metadata: ThirdlawGuardrailRequestMetadata
     request_url: str | None = None
-    request_headers: dict[str, str] | None = None
-    request_body: dict[str, object] | None = None
-    response_body: dict[str, object] | None = None
-    additional_provider_specific_params: dict[str, object] | None = None
+    request_headers: Mapping[str, str] | None = None
+    request_body: Mapping[str, object] | None = None
+    response_body: Mapping[str, object] | None = None
+    additional_provider_specific_params: Mapping[str, object] | None = None
 
 
 class ThirdlawGuardrailResponse(BaseModel):
@@ -50,8 +51,8 @@ class ThirdlawGuardrailResponse(BaseModel):
     model_config = ConfigDict(frozen=True, extra="allow")
 
     action: Literal["allow", "block", "modify_request", "modify_response"]
-    request_body: dict[str, object] | None = None
-    response_body: dict[str, object] | None = None
+    request_body: Mapping[str, object] | None = None
+    response_body: Mapping[str, object] | None = None
     response_status: int | None = None
     message: str = ""
 
@@ -83,8 +84,8 @@ class ThirdlawGuardrailConfigModel(GuardrailConfigModel[ThirdlawGuardrailConfigM
     api_base: str | None = Field(
         default=None,
         description="ThirdLaw intervene-service base URL; /guardrails/litellm/v2 is appended unless already present. Env: THIRDLAW_API_BASE.",
-        json_schema_extra={
-            "examples": [
+        json_schema_extra={  # mutable-ok: pydantic stores schema extras as plain JSON containers
+            "examples": [  # mutable-ok: pydantic stores schema extras as plain JSON containers
                 "https://api.thirdlaw.<your-domain>",
             ]
         },
