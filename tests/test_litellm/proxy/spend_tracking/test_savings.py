@@ -740,17 +740,17 @@ def test_a_baseline_with_no_cache_read_rate_is_charged_its_input_rate():
     """
     continuing = _usage(fresh=0, cached=0, written=20_000, out=1_000)
     reported = compute_autorouter_savings(
-        baseline_model="xai/grok-4",
+        baseline_model="groq/llama-3.3-70b-versatile",
         selected_model="claude-haiku-4-5",
         selected_provider="anthropic",
         usage=continuing,
         conversation_continuing=True,
     )
 
-    grok = litellm.get_model_info("grok-4", "xai")
-    assert grok.get("cache_read_input_token_cost") is None, "pick a baseline with no cache-read rate"
+    llama = litellm.get_model_info("llama-3.3-70b-versatile", "groq")
+    assert llama.get("cache_read_input_token_cost") is None, "pick a baseline with no cache-read rate"
     haiku = litellm.get_model_info("claude-haiku-4-5", "anthropic")
-    baseline_pays_input = 20_000 * grok["input_cost_per_token"] + 1_000 * grok["output_cost_per_token"]
+    baseline_pays_input = 20_000 * llama["input_cost_per_token"] + 1_000 * llama["output_cost_per_token"]
     actually_paid = 20_000 * haiku["cache_creation_input_token_cost"] + 1_000 * haiku["output_cost_per_token"]
     assert reported == pytest.approx(baseline_pays_input - actually_paid)
 
