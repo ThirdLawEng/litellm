@@ -50,7 +50,18 @@ EXCLUDED_TERMINAL_VARS = {
     "ALACRITTY_SOCKET",
 }
 
-EXCLUDED_KEYS = frozenset(EXCLUDED_TERMINAL_VARS | EXCLUDED_GUARD_ONLY_VARS | EXCLUDED_ROLLOUT_FLAGS)
+# Integrations that exist only on this fork: the public docs live in
+# BerriAI/litellm-docs, which cannot document a guardrail that has not been
+# upstreamed yet. Move these into the docs (and drop the entries) when the
+# integration lands upstream.
+EXCLUDED_FORK_INTEGRATION_VARS = {
+    "THIRDLAW_API_BASE",
+    "THIRDLAW_API_KEY",
+}
+
+EXCLUDED_KEYS = frozenset(
+    EXCLUDED_TERMINAL_VARS | EXCLUDED_GUARD_ONLY_VARS | EXCLUDED_ROLLOUT_FLAGS | EXCLUDED_FORK_INTEGRATION_VARS
+)
 
 # Directories to skip (dependencies, venvs, caches) - only scan litellm source
 SKIP_DIRS = {
