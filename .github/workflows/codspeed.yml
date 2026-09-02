@@ -37,6 +37,12 @@ concurrency:
 
 jobs:
   benchmarks:
+    # CodSpeed uploads authenticate via OIDC against the repository registered on
+    # codspeed.io. On forks that are not registered, the benchmarks run for the
+    # full 45+ minutes and then die with '401 Unauthorized' at upload. Skip unless
+    # this is the upstream repo or the fork opted in after registering (set the
+    # CODSPEED_ENABLED repository variable to 'true').
+    if: github.repository == 'BerriAI/litellm' || vars.CODSPEED_ENABLED == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
 
