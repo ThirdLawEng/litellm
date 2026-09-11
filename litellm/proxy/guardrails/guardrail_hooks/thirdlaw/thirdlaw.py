@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from types import MappingProxyType
 from typing import (
     TYPE_CHECKING,
+    ClassVar,
     Final,
     Literal,
     Protocol,
@@ -302,6 +303,12 @@ class ThirdlawGuardrailMissingConfig(ValueError):
 
 
 class ThirdlawGuardrail(CustomGuardrail):
+    # Implementing apply_guardrail otherwise moves every lifecycle event onto the unified
+    # path, where this guardrail's own pre/post hooks stop running and the real provider
+    # bodies never reach the service. apply_guardrail here serves only the Responses API
+    # streams delegated to the translation layer.
+    use_native_lifecycle_hooks: ClassVar[bool] = True
+
     def __init__(
         self,
         api_base: str | None = None,

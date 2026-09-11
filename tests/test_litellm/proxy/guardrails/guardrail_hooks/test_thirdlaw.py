@@ -968,3 +968,24 @@ async def test_non_responses_stream_still_uses_the_native_path():
 
     assert out == chunks
     assert seen == {}
+
+
+async def test_pre_call_still_scans_the_real_request_body():
+    """Implementing apply_guardrail must not move lifecycle events onto the unified path.
+
+    Without use_native_lifecycle_hooks the proxy stops calling these hooks, apply_guardrail
+    returns request inputs untouched, and request scanning silently becomes a no-op.
+    """
+    assert ThirdlawGuardrail.use_native_lifecycle_hooks is True
+
+    g = _make_guardrail(decisions=[_decision_response({"action": "allow"})])
+    await g.async_pre_call_hook(
+        user_api_key_dict=UserAPIKeyAuth(),
+        cache=DualCache(),
+        data=_request_data(),
+        call_type="completion",
+    )
+    payload = _sent_payload(g)
+    assert payload["event_type"] == "pre_call"
+    # The real provider body has to reach the service, not an extracted-text stand-in.
+    assert payload["request_body"]["messages"][0]["content"] == "my api key is sk-user-secret"
