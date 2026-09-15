@@ -1,4 +1,5 @@
 import json
+import logging
 from collections.abc import AsyncIterator, Sequence
 from typing import TypeAlias
 from unittest.mock import AsyncMock
@@ -1365,6 +1366,32 @@ def test_the_initializer_turns_stream_chunks_off_only_on_an_explicit_false():
     )
     assert on.send_stream_chunks is True
     assert off.send_stream_chunks is False
+
+
+async def test_the_debug_trail_names_every_payload_part_and_never_logs_a_header_value(
+    caplog: pytest.LogCaptureFixture,
+):
+    """The trail has to be enough to see how the post was built, and the raw Authorization a
+    caller opted in is exactly the kind of value a log must not carry."""
+    g = _make_guardrail(decisions=[_decision_response({"action": "allow"})], additional_headers="authorization")
+    with caplog.at_level(logging.DEBUG, logger="LiteLLM Proxy"):
+        await _collect(
+            g.async_post_call_streaming_iterator_hook(
+                user_api_key_dict=UserAPIKeyAuth(),
+                response=_aiter(_responses_stream_chunks()),
+                request_data=_request_data(),
+            )
+        )
+    trail = caplog.text
+    assert "request_body taken from the proxy_server_request.body snapshot" in trail
+    assert "response_body built from the hook's ResponsesAPIResponse as a response body" in trail
+    assert "classified as RESPONSES assembled into ResponsesAPIResponse" in trail
+    assert "post_call wire request for" in trail and "response_chunks=3" in trail
+    assert "decision action=allow" in trail
+    assert "wire request (header values redacted)" in trail
+    assert "sk-live-raw" not in trail
+    assert "sk-forwarded-provider-key" not in trail
+    assert _sent_payload(g)["request_headers"]["authorization"] == "Bearer sk-live-raw"
 
 
 @pytest.mark.parametrize("typo", ["fail_close", "failopen", "FAIL_OPEN", ""])

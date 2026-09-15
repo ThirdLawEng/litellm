@@ -1,4 +1,5 @@
 import json
+import logging
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Mapping, Sequence
 from datetime import datetime, timezone
@@ -67,6 +68,9 @@ GUARDRAIL_NAME: Final = "thirdlaw"
 _ENDPOINT_PATH: Final = "/guardrails/litellm/v2"
 
 _UNREACHABLE_STATUS_CODES: Final = frozenset({502, 503, 504})
+
+# The debug trail dumps the assembled wire request; a long stream would otherwise flood the log
+_PAYLOAD_LOG_CHARS: Final = 4000
 
 # Not part of the provider request body. ``secret_fields`` holds plaintext Authorization
 # values and ``api_key`` can carry a client-forwarded provider key, so neither may leave the proxy.
@@ -232,6 +236,12 @@ def _request_body(request_data: Mapping[str, object], prefer_snapshot: bool) -> 
     """
     snapshot: Final = _dict_of(_proxy_server_request(request_data).get("body")) if prefer_snapshot else None
     source: Final = snapshot if snapshot is not None else request_data
+    verbose_proxy_logger.debug(
+        "ThirdLaw guardrail: request_body taken from %s; keeping %s, stripping %s",
+        "the proxy_server_request.body snapshot" if snapshot is not None else "live request_data",
+        sorted(key for key in source if key not in _BODY_STRIP_KEYS),
+        sorted(key for key in source if key in _BODY_STRIP_KEYS),
+    )
     try:
         return _jsonable_dict(
             MappingProxyType({key: value for key, value in source.items() if key not in _BODY_STRIP_KEYS})
@@ -250,7 +260,17 @@ def _response_payload(response: object) -> Mapping[str, object] | None:
         return None
     as_dict: Final = _dict_of(raw)
     if as_dict is None:
+        verbose_proxy_logger.debug(
+            "ThirdLaw guardrail: response_body skipped, the hook handed a %s that is not a JSON object",
+            type(response).__name__,
+        )
         return None
+    verbose_proxy_logger.debug(
+        "ThirdLaw guardrail: response_body built from the hook's %s as a %s body with keys %s",
+        type(response).__name__,
+        _shape_of(as_dict),
+        sorted(as_dict),
+    )
     try:
         return _jsonable_dict(as_dict)
     except Exception:  # noqa: BLE001  # best-effort capture; a raise here would fail live traffic
@@ -279,6 +299,36 @@ def _stream_chunk_payload(item: object) -> Mapping[str, object] | None:
     if isinstance(sequence, int) and "sequence_number" not in dumped_dict:
         return _jsonable_dict(MappingProxyType({**dumped_dict, "sequence_number": sequence}))
     return _jsonable_dict(dumped_dict)
+
+
+def _shape_of(value: object) -> str:
+    """A one-word name for a body's wire shape, for the debug trail: ``chat.completion``,
+    ``response``, ``message``, or the Python type when it is none of those."""
+    body: Final = _dict_of(value)
+    if body is None:
+        return type(value).__name__
+    for key in ("object", "type"):
+        if isinstance(named := body.get(key), str):
+            return named
+    return "choices" if "choices" in body else "dict"
+
+
+def _redacted_payload_json(payload: ThirdlawGuardrailRequest) -> str:
+    """The wire request as JSON with header values blanked and the length capped.
+
+    Header values can carry the caller's raw Authorization when a name is opted in, so only the
+    names are logged. Bodies are logged as-is: this is a debug trail behind --detailed_debug,
+    which already prints request bodies elsewhere in the proxy.
+    """
+    dumped: Final = payload.model_dump(mode="json", exclude_none=True)
+    headers: Final = dumped.get("request_headers")
+    redacted: Final = (
+        {**dumped, "request_headers": {name: "<redacted>" for name in headers}} if isinstance(headers, dict) else dumped
+    )
+    encoded: Final = json.dumps(redacted, default=str)
+    if len(encoded) <= _PAYLOAD_LOG_CHARS:
+        return encoded
+    return f"{encoded[:_PAYLOAD_LOG_CHARS]}...<truncated, {len(encoded)} chars total>"
 
 
 def _is_unreachable_error(error: Exception) -> bool:
@@ -396,7 +446,7 @@ class ThirdlawGuardrail(CustomGuardrail):
             self.get_guardrail_dynamic_request_body_params(request_data)
         )
         combined_params: Final = MappingProxyType({**self.additional_provider_specific_params, **dynamic_params})
-        return ThirdlawGuardrailRequest(
+        wire_request: Final = ThirdlawGuardrailRequest(
             event_type=wire_event,
             metadata=_request_metadata(request_data),
             request_url=_request_url(request_data),
@@ -408,6 +458,24 @@ class ThirdlawGuardrail(CustomGuardrail):
             streamed_deltas_not_in_body=tuple(streamed_deltas) if streamed_deltas else None,
             additional_provider_specific_params=combined_params or None,
         )
+        verbose_proxy_logger.debug(
+            "ThirdLaw guardrail: %s wire request for %s | request_body=%s key(s) | response_body=%s | "
+            "response_chunks=%s | response_sse=%s | streamed_deltas_not_in_body=%d | headers=%s (raw values for %s)",
+            wire_event,
+            wire_request.request_url or "<no request_url>",
+            "none" if wire_request.request_body is None else len(wire_request.request_body),
+            "none" if wire_request.response_body is None else _shape_of(wire_request.response_body),
+            "none" if wire_request.response_chunks is None else len(wire_request.response_chunks),
+            "none" if wire_request.response_sse is None else f"{len(wire_request.response_sse)} chars",
+            len(wire_request.streamed_deltas_not_in_body or ()),
+            sorted(wire_request.request_headers or ()),
+            sorted(self.raw_value_header_names) or "none",
+        )
+        if verbose_proxy_logger.isEnabledFor(logging.DEBUG):
+            verbose_proxy_logger.debug(
+                "ThirdLaw guardrail: wire request (header values redacted): %s", _redacted_payload_json(wire_request)
+            )
+        return wire_request
 
     def _record_trace(
         self,
@@ -473,14 +541,33 @@ class ThirdlawGuardrail(CustomGuardrail):
             response_chunks=response_chunks,
             response_sse=response_sse,
         )
+        wire_body: Final = payload.model_dump(mode="json", exclude_none=True)
+        if verbose_proxy_logger.isEnabledFor(logging.DEBUG):
+            verbose_proxy_logger.debug(
+                "ThirdLaw guardrail: POST %s | %s event | %d bytes | outbound header names %s",
+                self.api_base,
+                wire_event,
+                len(json.dumps(wire_body, default=str)),
+                sorted(self.http_headers),
+            )
         try:
             http_response: Final = await self.async_handler.post(
                 url=self.api_base,
                 headers=dict(self.http_headers),  # mutable-ok: the HTTP client requires a plain dict
-                json=payload.model_dump(mode="json", exclude_none=True),
+                json=wire_body,
             )
             http_response.raise_for_status()
             decision: Final = ThirdlawGuardrailResponse.model_validate(http_response.json())
+            verbose_proxy_logger.debug(
+                "ThirdLaw guardrail: decision action=%s response_status=%s modified_request=%s modified_response=%s "
+                "| HTTP %s in %.0f ms",
+                decision.action,
+                decision.response_status,
+                decision.request_body is not None,
+                decision.response_body is not None,
+                http_response.status_code,
+                (datetime.now(timezone.utc) - started_at).total_seconds() * 1000,
+            )
         except Exception as error:  # noqa: BLE001  # every transport/parse failure funnels into the fallback policy
             self._record_trace(
                 request_data=request_data,
@@ -711,6 +798,17 @@ class ThirdlawGuardrail(CustomGuardrail):
     @staticmethod
     def _assembled_stream_response(collected: Sequence[object], surface: StreamSurface) -> _AssembledStream | None:
         """Assemble the buffered stream into the scannable body its surface produces."""
+        assembled: Final = ThirdlawGuardrail._assemble_for_surface(collected, surface)
+        verbose_proxy_logger.debug(
+            "ThirdLaw guardrail: %d buffered stream item(s) classified as %s assembled into %s",
+            len(collected),
+            surface.name,
+            "nothing" if assembled is None else f"{type(assembled).__name__} ({_shape_of(assembled)})",
+        )
+        return assembled
+
+    @staticmethod
+    def _assemble_for_surface(collected: Sequence[object], surface: StreamSurface) -> _AssembledStream | None:
         match surface:
             case StreamSurface.ANTHROPIC_MESSAGES:
                 return assemble_anthropic_sse_body(collected)
@@ -750,6 +848,9 @@ class ThirdlawGuardrail(CustomGuardrail):
         LiteLLM release in between. Returns ``(chunks, sse_text)``; at most one is set.
         """
         if not self.send_stream_chunks:
+            verbose_proxy_logger.debug(
+                "ThirdLaw guardrail: stream not posted beside the body (send_stream_chunks=False)"
+            )
             return None, None
         match surface:
             case StreamSurface.ANTHROPIC_MESSAGES:
