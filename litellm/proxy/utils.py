@@ -17,7 +17,20 @@ from datetime import date, datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, ClassVar, Final, Literal, Optional, Protocol, TypeVar, Union, cast, overload
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    ClassVar,
+    Final,
+    Generic,
+    Literal,
+    Optional,
+    Protocol,
+    TypeVar,
+    Union,
+    cast,
+    overload,
+)
 
 from typing_extensions import ReadOnly, TypedDict
 
@@ -427,6 +440,42 @@ def _enrich_http_exception_with_guardrail_context(exc: BaseException, callback: 
     event_hook: Final[object] = getattr(callback, "event_hook", None)
     if event_hook:
         detail.setdefault("guardrail_mode", event_hook)
+
+
+class _EnrichedGuardrailStream(Generic[_T]):
+    """One layer of the async_post_call_streaming_iterator_hook chain.
+
+    Carries `_hidden_params` forward from `source` (see
+    `ProxyLogging._wrap_streaming_iterator_with_enrichment`) and enriches any
+    HTTPException raised while iterating `gen` with the originating callback's
+    guardrail context, mirroring `FallbackStreamWrapper` /
+    `FallbackAwareAnthropicMessagesStream` in router.py, which solve the same
+    "a bare async generator can't carry attributes" problem one layer down.
+    """
+
+    def __init__(self, *, callback: object, gen: AsyncGenerator[_T, None], source: object) -> None:
+        self._callback = callback
+        self._gen = gen
+        self._hidden_params: dict[str, object] = dict(  # mutable-ok: mirrors FallbackStreamWrapper in router.py
+            getattr(source, "_hidden_params", None) or {}
+        )
+
+    def __aiter__(self) -> "_EnrichedGuardrailStream[_T]":
+        return self
+
+    async def __anext__(self) -> _T:
+        try:
+            return await self._gen.__anext__()
+        except StopAsyncIteration:
+            raise
+        except Exception as e:
+            _enrich_http_exception_with_guardrail_context(e, self._callback)
+            raise
+
+    async def aclose(self) -> None:
+        aclose: Final = getattr(self._gen, "aclose", None)
+        if callable(aclose):
+            await aclose()
 
 
 def _exception_changes_request_flow(exc: BaseException) -> bool:
@@ -2441,23 +2490,28 @@ class ProxyLogging:
             )
 
     @staticmethod
-    async def _wrap_streaming_iterator_with_enrichment(
-        callback: object, gen: AsyncGenerator[_T, None]
-    ) -> AsyncGenerator[_T, None]:
+    def _wrap_streaming_iterator_with_enrichment(
+        callback: object, gen: AsyncGenerator[_T, None], *, source: object
+    ) -> "_EnrichedGuardrailStream[_T]":
         """
-        Yield from `gen`; if iteration raises an HTTPException with dict detail,
+        Wrap `gen`; if iteration raises an HTTPException with dict detail,
         enrich the detail with the originating callback's `guardrail_name` and
         `guardrail_mode` before re-raising. Used to wrap each layer of the
         async_post_call_streaming_iterator_hook chain so the enrichment is
         attributed to the callback that produced the chunk pipeline at that
         point in the chain.
+
+        `source` is the object that was fed into `callback`'s hook (i.e. the
+        previous layer's output, or the original response for the first
+        callback in the chain); its `_hidden_params` -- e.g. provider response
+        headers -- are copied onto the returned wrapper so the next callback in
+        the chain still sees them. Without this, a hook implemented as a plain
+        `async def ...: yield ...` generator (the common case -- e.g.
+        `ResponsesIDSecurity.async_post_call_streaming_iterator_hook`) produces
+        a bare async generator, which cannot itself carry `_hidden_params`, and
+        every callback chained after it would silently lose them.
         """
-        try:
-            async for chunk in gen:
-                yield chunk
-        except Exception as e:
-            _enrich_http_exception_with_guardrail_context(e, callback)
-            raise
+        return _EnrichedGuardrailStream(callback=callback, gen=gen, source=source)
 
     # Cache for callback-capability detection. Keyed on a signature of
     # litellm.callbacks (length + each item's id) so we recompute when the
@@ -3600,6 +3654,7 @@ class ProxyLogging:
                         response=current_response,
                         request_data=request_data,
                     ),
+                    source=current_response,
                 )
             else:
                 # kind == "apply_guardrail": route through unified_guardrail
@@ -3612,6 +3667,7 @@ class ProxyLogging:
                         guardrail_to_apply=resolved_callback,
                         buffer_until_moderated_default=(kind == "override"),
                     ),
+                    source=current_response,
                 )
 
         pipeline_translation: Final = (

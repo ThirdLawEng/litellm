@@ -171,7 +171,7 @@ async def test_wrap_streaming_iterator_with_enrichment_passes_through_chunks(pro
             yield ch
 
     cb = MagicMock(guardrail_name="g", event_hook="pre_call")
-    wrapped = proxy_logging._wrap_streaming_iterator_with_enrichment(callback=cb, gen=gen())
+    wrapped = proxy_logging._wrap_streaming_iterator_with_enrichment(callback=cb, gen=gen(), source=None)
     out = [ch async for ch in wrapped]
     snapshot = {
         "chunks": out,
@@ -197,7 +197,7 @@ async def test_wrap_streaming_iterator_with_enrichment_enriches_http_exception_r
         raise HTTPException(status_code=400, detail=detail)
 
     cb = MagicMock(guardrail_name="presidio", event_hook="post_call")
-    wrapped = proxy_logging._wrap_streaming_iterator_with_enrichment(callback=cb, gen=boom_gen())
+    wrapped = proxy_logging._wrap_streaming_iterator_with_enrichment(callback=cb, gen=boom_gen(), source=None)
     with pytest.raises(HTTPException):
         async for _ in wrapped:
             pass
@@ -333,6 +333,64 @@ async def test_async_post_call_streaming_iterator_hook_with_override_chains_call
     ):
         out.append(ch)
     assert out == ["a*", "b*"]
+
+
+@pytest.mark.asyncio
+async def test_async_post_call_streaming_iterator_hook_preserves_hidden_params_across_chain(
+    proxy_logging, make_user_api_key_auth, monkeypatch
+):
+    """A hook implemented as a plain ``async def ...: yield ...`` generator (e.g.
+    ``ResponsesIDSecurity.async_post_call_streaming_iterator_hook``, which is
+    unconditionally registered whenever the proxy has a database configured,
+    independent of any guardrail config) produces a bare async generator with no
+    ``_hidden_params`` of its own. A second callback chained after it must still
+    see the original response's ``_hidden_params`` (e.g. provider response
+    headers), not an empty/missing one.
+    """
+
+    class _BarePassthroughHook(CustomLogger):
+        """Mirrors ResponsesIDSecurity's hook: touches nothing, carries nothing."""
+
+        async def async_post_call_streaming_iterator_hook(self, **kwargs):  # type: ignore[override]
+            async for ch in kwargs["response"]:
+                yield ch
+
+    seen_hidden_params: dict[str, Any] = {}
+
+    class _RecordsHiddenParams(CustomLogger):
+        async def async_post_call_streaming_iterator_hook(self, **kwargs):  # type: ignore[override]
+            response = kwargs["response"]
+            seen_hidden_params.update(getattr(response, "_hidden_params", None) or {})
+            async for ch in response:
+                yield ch
+
+    monkeypatch.setattr(litellm, "callbacks", [_BarePassthroughHook(), _RecordsHiddenParams()])
+
+    class _SourceStream:
+        _hidden_params = {"additional_headers": {"x-request-id": "req-1"}}
+
+        def __init__(self) -> None:
+            self._chunks = iter(("a", "b"))
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self._chunks)
+            except StopIteration:
+                raise StopAsyncIteration
+
+    out: list[str] = []
+    async for ch in proxy_logging.async_post_call_streaming_iterator_hook(
+        response=_SourceStream(),
+        user_api_key_dict=make_user_api_key_auth(),
+        request_data={},
+    ):
+        out.append(ch)
+
+    assert out == ["a", "b"]
+    assert seen_hidden_params == {"additional_headers": {"x-request-id": "req-1"}}
 
 
 @pytest.mark.asyncio
