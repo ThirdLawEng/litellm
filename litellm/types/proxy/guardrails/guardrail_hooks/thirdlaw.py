@@ -45,6 +45,7 @@ class ThirdlawGuardrailRequest(BaseModel):
     request_headers: Mapping[str, str] | None = None
     request_body: Mapping[str, object] | None = None
     response_body: Mapping[str, object] | None = None
+    response_headers: Mapping[str, str] | None = None
     # The buffered stream beside the assembled body: the events a /v1/responses or chat completions
     # client received, or the raw SSE text a /v1/messages client received. The service may fold
     # either side and fall back to the other, without a LiteLLM release in between.

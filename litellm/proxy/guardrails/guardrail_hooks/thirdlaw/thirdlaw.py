@@ -346,6 +346,28 @@ def _outbound_request_headers(
     return MappingProxyType({**from_redacted, **reintroduced})
 
 
+def _response_headers(response: object) -> Mapping[str, str] | None:
+    """The upstream provider's raw HTTP response headers, if ``response`` carries them.
+
+    Every provider transformation stamps these onto ``_hidden_params["additional_headers"]``
+    before any post-call hook runs (``process_response_headers`` in core_helpers.py), and the
+    streaming iterator/wrapper classes (``CustomStreamWrapper``, the Responses and Anthropic
+    Messages stream wrappers) stamp the same snapshot on themselves at construction, so this
+    reads identically whether ``response`` is a finished response or the still-open stream.
+    ``_hidden_params`` is occasionally the ``HiddenParams`` pydantic model rather than a plain
+    dict, hence the attribute fallback below.
+    """
+    hidden_params: Final[object] = getattr(response, "_hidden_params", None)
+    headers: Final[object] = (
+        hidden_params.get("additional_headers")
+        if isinstance(hidden_params, Mapping)
+        else getattr(hidden_params, "additional_headers", None)
+    )
+    if not isinstance(headers, Mapping) or not headers:
+        return None
+    return MappingProxyType({str(k): str(v) for k, v in headers.items()})
+
+
 def _request_body(request_data: Mapping[str, object], prefer_snapshot: bool) -> Mapping[str, object] | None:
     """Best-effort provider request body; never raises because a guardrail that throws
     here would fail live traffic.
@@ -537,6 +559,7 @@ class ThirdlawGuardrail(CustomGuardrail):
         wire_event: _WireEvent,
         request_data: dict[str, object],  # mutable-ok: proxy-shared request dict, forwarded to base-class helpers
         response_body: Mapping[str, object] | None,
+        response_headers: Mapping[str, str] | None = None,
         streamed_deltas: Sequence[str] | None = None,
         response_chunks: Sequence[Mapping[str, object]] | None = None,
         response_sse: str | None = None,
@@ -552,6 +575,7 @@ class ThirdlawGuardrail(CustomGuardrail):
             request_headers=_outbound_request_headers(request_data, self.raw_value_header_names),
             request_body=_request_body(request_data, prefer_snapshot=wire_event != "pre_call"),
             response_body=response_body,
+            response_headers=response_headers,
             response_chunks=tuple(response_chunks) if response_chunks else None,
             response_sse=response_sse or None,
             streamed_deltas_not_in_body=tuple(streamed_deltas) if streamed_deltas else None,
@@ -602,6 +626,7 @@ class ThirdlawGuardrail(CustomGuardrail):
         wire_event: _WireEvent,
         request_data: dict[str, object],  # mutable-ok: proxy-shared request dict; trace records land in it
         response_body: Mapping[str, object] | None = None,
+        response_headers: Mapping[str, str] | None = None,
         streamed_deltas: Sequence[str] | None = None,
         response_chunks: Sequence[Mapping[str, object]] | None = None,
         response_sse: str | None = None,
@@ -618,6 +643,7 @@ class ThirdlawGuardrail(CustomGuardrail):
             wire_event=wire_event,
             request_data=request_data,
             response_body=response_body,
+            response_headers=response_headers,
             streamed_deltas=streamed_deltas,
             response_chunks=response_chunks,
             response_sse=response_sse,
@@ -839,6 +865,7 @@ class ThirdlawGuardrail(CustomGuardrail):
             wire_event="post_call",
             request_data=data,
             response_body=response_body,
+            response_headers=_response_headers(response),
         )
         if decision is None:
             return response
@@ -862,10 +889,17 @@ class ThirdlawGuardrail(CustomGuardrail):
     ) -> AsyncGenerator[ModelResponseStream, None]:
         buffer: Final = self._buffer_until_moderated()
         end_of_stream_only: Final = buffer or self.streaming_end_of_stream_only
+        # Read before the iterator is consumed: the wrapper (CustomStreamWrapper and the
+        # Responses/Anthropic Messages stream wrappers) carries the provider's response headers
+        # on itself, snapshotted at stream open, so this is available up front rather than only
+        # once buffering finishes.
+        response_headers: Final = _response_headers(response)
         iterator: Final = (
-            self._end_of_stream_moderated_stream(response=response, request_data=request_data, buffer=buffer)
+            self._end_of_stream_moderated_stream(
+                response=response, request_data=request_data, buffer=buffer, response_headers=response_headers
+            )
             if end_of_stream_only
-            else self._sampled_stream(response=response, request_data=request_data)
+            else self._sampled_stream(response=response, request_data=request_data, response_headers=response_headers)
         )
         async for item in iterator:
             # Raw-SSE frames (bytes) ride through the same pipe; the proxy's data
@@ -1003,6 +1037,7 @@ class ThirdlawGuardrail(CustomGuardrail):
         response: AsyncIterator[object],
         request_data: dict[str, object],  # mutable-ok: proxy-shared request dict; trace records land in it
         buffer: bool,
+        response_headers: Mapping[str, str] | None,
     ) -> AsyncGenerator[object, None]:
         started: Final = time.monotonic()
         collected: Final[list[object]] = []  # mutable-ok: streaming chunk buffer
@@ -1025,6 +1060,7 @@ class ThirdlawGuardrail(CustomGuardrail):
                 wire_event="post_call",
                 request_data=request_data,
                 response_body=_response_payload(assembled),
+                response_headers=response_headers,
                 streamed_deltas=self._streamed_deltas_not_in_body(collected, assembled, surface),
                 response_chunks=stream_chunks,
                 response_sse=stream_sse,
@@ -1199,6 +1235,7 @@ class ThirdlawGuardrail(CustomGuardrail):
         *,
         response: AsyncIterator[object],
         request_data: dict[str, object],  # mutable-ok: proxy-shared request dict; trace records land in it
+        response_headers: Mapping[str, str] | None,
     ) -> AsyncGenerator[object, None]:
         sampling_rate: Final = self.streaming_sampling_rate
         collected: Final[list[object]] = []  # mutable-ok: streaming chunk buffer
@@ -1215,6 +1252,7 @@ class ThirdlawGuardrail(CustomGuardrail):
                 wire_event="post_call",
                 request_data=request_data,
                 response_body=_response_payload(interim),
+                response_headers=response_headers,
             )
             if interim_decision is not None and interim_decision.action == "block":
                 raise self._streaming_block_error(interim_decision.message or "Content violates ThirdLaw policy")
@@ -1239,6 +1277,7 @@ class ThirdlawGuardrail(CustomGuardrail):
             wire_event="post_call",
             request_data=request_data,
             response_body=_response_payload(assembled),
+            response_headers=response_headers,
             streamed_deltas=self._streamed_deltas_not_in_body(collected, assembled, surface),
             response_chunks=stream_chunks,
             response_sse=stream_sse,

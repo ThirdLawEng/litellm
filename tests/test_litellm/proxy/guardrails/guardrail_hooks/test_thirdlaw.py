@@ -780,6 +780,28 @@ async def test_post_call_modify_response_carries_hidden_params(response_factory)
     assert out._hidden_params.get("additional_headers") == {"x-request-id": "abc123"}
 
 
+@pytest.mark.parametrize("response_factory", [_model_response, _responses_api_response])
+async def test_post_call_forwards_response_headers_to_thirdlaw(response_factory):
+    """The provider's response headers land in _hidden_params before any post-call hook runs;
+    the guardrail must read them from there and post them alongside response_body."""
+    response = response_factory()
+    response._hidden_params["additional_headers"] = {"x-request-id": "req-99", "llm_provider-x-ratelimit": "10"}
+    g = _make_guardrail(decisions=[_decision_response({"action": "allow"})])
+    await g.async_post_call_success_hook(data=_request_data(), user_api_key_dict=UserAPIKeyAuth(), response=response)
+    assert _sent_payload(g)["response_headers"] == {
+        "x-request-id": "req-99",
+        "llm_provider-x-ratelimit": "10",
+    }
+
+
+async def test_post_call_omits_response_headers_when_absent():
+    g = _make_guardrail(decisions=[_decision_response({"action": "allow"})])
+    await g.async_post_call_success_hook(
+        data=_request_data(), user_api_key_dict=UserAPIKeyAuth(), response=_model_response()
+    )
+    assert "response_headers" not in _sent_payload(g)
+
+
 async def test_post_call_block_raises():
     g = _make_guardrail(decisions=[_decision_response({"action": "block", "message": "leaked secret"})])
     with pytest.raises(GuardrailRaisedException) as exc_info:
@@ -1119,6 +1141,19 @@ async def _collect(agen: AsyncIterator[object]) -> list[object]:
     return [item async for item in agen]
 
 
+class _StreamWithHiddenParams:
+    """Mimics CustomStreamWrapper: an async-iterable whose chunks are plain ModelResponseStream
+    objects, but which itself carries _hidden_params (the provider response headers, snapshotted
+    once at stream open)."""
+
+    def __init__(self, items: Sequence[object], hidden_params: JsonDict) -> None:
+        self._items = items
+        self._hidden_params = hidden_params
+
+    def __aiter__(self) -> AsyncIterator[object]:
+        return _aiter(self._items)
+
+
 async def test_streaming_buffered_allow_replays_original_chunks():
     g = _make_guardrail(decisions=[_decision_response({"action": "allow"})])
     chunks = _stream_chunks()
@@ -1131,6 +1166,42 @@ async def test_streaming_buffered_allow_replays_original_chunks():
     payload = _sent_payload(g)
     assert payload["event_type"] == "post_call"
     assert payload["response_body"]["choices"][0]["message"]["content"] == "the secret is sk-leak"
+
+
+async def test_streaming_forwards_response_headers_from_the_stream_wrapper():
+    """Individual ModelResponseStream chunks carry no _hidden_params of their own -- the headers
+    live on the CustomStreamWrapper (or Responses/Anthropic Messages equivalent) that the proxy
+    passes in as `response`, snapshotted once at stream open, so they must be read from there
+    rather than from the buffered chunks."""
+    g = _make_guardrail(decisions=[_decision_response({"action": "allow"})])
+    stream = _StreamWithHiddenParams(
+        _stream_chunks(), hidden_params={"additional_headers": {"x-request-id": "req-77"}}
+    )
+    await _collect(
+        g.async_post_call_streaming_iterator_hook(
+            user_api_key_dict=UserAPIKeyAuth(), response=stream, request_data=_request_data()
+        )
+    )
+    assert _sent_payload(g)["response_headers"] == {"x-request-id": "req-77"}
+
+
+async def test_sampled_stream_forwards_response_headers_from_the_stream_wrapper():
+    """Same as the buffered case, for the end-of-stream call on the sampled (non-buffered) path."""
+    g = _make_guardrail(
+        streaming_buffer_until_moderated=False,
+        streaming_end_of_stream_only=False,
+        streaming_sampling_rate=100,
+        decisions=[_decision_response({"action": "allow"})],
+    )
+    stream = _StreamWithHiddenParams(
+        _stream_chunks(), hidden_params={"additional_headers": {"x-request-id": "req-78"}}
+    )
+    await _collect(
+        g.async_post_call_streaming_iterator_hook(
+            user_api_key_dict=UserAPIKeyAuth(), response=stream, request_data=_request_data()
+        )
+    )
+    assert _sent_payload(g)["response_headers"] == {"x-request-id": "req-78"}
 
 
 async def test_streaming_buffered_modify_emits_rewritten_response():
