@@ -364,6 +364,17 @@ def _response_headers(response: object) -> Mapping[str, str] | None:
         else getattr(hidden_params, "additional_headers", None)
     )
     if not isinstance(headers, Mapping) or not headers:
+        # Names only (never values) so a real Authorization/x-api-key header never lands
+        # in the log, mirroring the redaction discipline in _outbound_request_headers.
+        verbose_proxy_logger.debug(
+            "ThirdLaw guardrail: no response headers found on response type=%s hidden_params_type=%s "
+            "hidden_params_keys=%s",
+            type(response).__name__,
+            type(hidden_params).__name__,
+            sorted(hidden_params.keys())
+            if isinstance(hidden_params, Mapping)
+            else getattr(hidden_params, "__dict__", None),
+        )
         return None
     return MappingProxyType({str(k): str(v) for k, v in headers.items()})
 
