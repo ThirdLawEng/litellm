@@ -368,6 +368,17 @@ def _response_headers(response: object) -> Mapping[str, str] | None:
     return MappingProxyType({str(k): str(v) for k, v in headers.items()})
 
 
+# Where async_post_call_response_headers_hook stashes response headers for the
+# streaming/success hooks to read back. Unprefixed by request_data's other keys
+# on purpose -- this is ThirdLaw's own scratch slot, never read or written by core.
+_RESPONSE_HEADERS_STASH_KEY: Final = "_thirdlaw_response_headers"
+
+
+def _stashed_response_headers(request_data: Mapping[str, object]) -> Mapping[str, str] | None:
+    stashed: Final = request_data.get(_RESPONSE_HEADERS_STASH_KEY)
+    return stashed if isinstance(stashed, Mapping) else None
+
+
 def _request_body(request_data: Mapping[str, object], prefer_snapshot: bool) -> Mapping[str, object] | None:
     """Best-effort provider request body; never raises because a guardrail that throws
     here would fail live traffic.
@@ -802,6 +813,26 @@ class ThirdlawGuardrail(CustomGuardrail):
 
         add_guardrail_to_applied_guardrails_header(request_data=request_data, guardrail_name=self.guardrail_name)
 
+    async def async_post_call_response_headers_hook(
+        self,
+        data: dict[str, object],  # mutable-ok: proxy-shared request dict, per the CustomLogger hook contract
+        user_api_key_dict: UserAPIKeyAuth,
+        response: object,
+        request_headers: Mapping[str, str] | None = None,
+        litellm_call_info: Mapping[str, object] | None = None,
+    ) -> Mapping[str, str] | None:
+        """Capture the provider's response headers off the true, unwrapped response.
+
+        A guardrail chained ahead of ThirdLaw can obscure ``_hidden_params`` on the
+        ``response`` the streaming hook later receives (``ResponsesIDSecurity``, e.g.,
+        hands back a bare generator with none); this hook always gets the real thing.
+        Always returns None -- it only stashes for ThirdLaw's own later use.
+        """
+        headers: Final = _response_headers(response)
+        if headers is not None:
+            data[_RESPONSE_HEADERS_STASH_KEY] = headers
+        return None
+
     @log_guardrail_information
     async def async_pre_call_hook(
         self,
@@ -810,6 +841,7 @@ class ThirdlawGuardrail(CustomGuardrail):
         data: dict[str, object],  # mutable-ok: proxy-shared request dict, per the CustomLogger hook contract
         call_type: CallTypesLiteral,
     ) -> dict[str, object]:  # mutable-ok: the proxy replaces its request dict with this return value
+        data.pop(_RESPONSE_HEADERS_STASH_KEY, None)  # strip any caller-forged value; always runs first
         decision: Final = await self._run_thirdlaw(
             event_type=GuardrailEventHooks.pre_call, wire_event="pre_call", request_data=data
         )
@@ -865,7 +897,7 @@ class ThirdlawGuardrail(CustomGuardrail):
             wire_event="post_call",
             request_data=data,
             response_body=response_body,
-            response_headers=_response_headers(response),
+            response_headers=_stashed_response_headers(data) or _response_headers(response),
         )
         if decision is None:
             return response
@@ -889,11 +921,10 @@ class ThirdlawGuardrail(CustomGuardrail):
     ) -> AsyncGenerator[ModelResponseStream, None]:
         buffer: Final = self._buffer_until_moderated()
         end_of_stream_only: Final = buffer or self.streaming_end_of_stream_only
-        # Read before the iterator is consumed: the wrapper (CustomStreamWrapper and the
-        # Responses/Anthropic Messages stream wrappers) carries the provider's response headers
-        # on itself, snapshotted at stream open, so this is available up front rather than only
-        # once buffering finishes.
-        response_headers: Final = _response_headers(response)
+        # Prefer the stash (see async_post_call_response_headers_hook); `response` here
+        # can be a bare generator with no _hidden_params once another callback is
+        # chained ahead of ThirdLaw. Falls back to `response` when ThirdLaw runs alone.
+        response_headers: Final = _stashed_response_headers(request_data) or _response_headers(response)
         iterator: Final = (
             self._end_of_stream_moderated_stream(
                 response=response, request_data=request_data, buffer=buffer, response_headers=response_headers
