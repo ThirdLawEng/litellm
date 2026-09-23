@@ -838,6 +838,40 @@ async def test_post_call_success_hook_prefers_the_stash_over_the_response_object
     assert _sent_payload(g)["response_headers"] == {"x-request-id": "from-stash"}
 
 
+async def test_pre_call_strips_a_caller_forged_response_headers_stash():
+    """Only _UNTRUSTED_ROOT_CONTROL_FIELDS is stripped from a caller's raw request body
+    before any hook sees `data`; our stash key isn't on that list, so a caller could
+    otherwise plant a fake value there themselves."""
+    g = _make_guardrail(decisions=[_decision_response({"action": "allow"})])
+    data = _request_data()
+    data["_thirdlaw_response_headers"] = {"x-forged-by": "the caller"}
+    await _run_pre_call(g, data)
+    assert "_thirdlaw_response_headers" not in data
+
+
+async def test_streaming_never_trusts_a_caller_forged_response_headers_stash():
+    """A caller-forged stash entry must not survive to the wire payload, even when the
+    stream itself carries no real headers (e.g. another callback's bare generator, as in
+    test_streaming_falls_back_to_the_stash_when_response_carries_no_hidden_params)."""
+    g = _make_guardrail(decisions=[_decision_response({"action": "allow"}), _decision_response({"action": "allow"})])
+    data = _request_data()
+    data["_thirdlaw_response_headers"] = {"x-forged-by": "the caller"}
+    await _run_pre_call(g, data)  # the real proxy always runs this first
+
+    async def bare_generator_with_no_hidden_params():
+        for chunk in _stream_chunks():
+            yield chunk
+
+    await _collect(
+        g.async_post_call_streaming_iterator_hook(
+            user_api_key_dict=UserAPIKeyAuth(),
+            response=bare_generator_with_no_hidden_params(),
+            request_data=data,
+        )
+    )
+    assert "response_headers" not in _sent_payload(g)
+
+
 async def test_post_call_block_raises():
     g = _make_guardrail(decisions=[_decision_response({"action": "block", "message": "leaked secret"})])
     with pytest.raises(GuardrailRaisedException) as exc_info:

@@ -841,6 +841,7 @@ class ThirdlawGuardrail(CustomGuardrail):
         data: dict[str, object],  # mutable-ok: proxy-shared request dict, per the CustomLogger hook contract
         call_type: CallTypesLiteral,
     ) -> dict[str, object]:  # mutable-ok: the proxy replaces its request dict with this return value
+        data.pop(_RESPONSE_HEADERS_STASH_KEY, None)  # strip any caller-forged value; always runs first
         decision: Final = await self._run_thirdlaw(
             event_type=GuardrailEventHooks.pre_call, wire_event="pre_call", request_data=data
         )
