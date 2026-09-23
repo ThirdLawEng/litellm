@@ -1210,9 +1210,7 @@ async def test_streaming_forwards_response_headers_from_the_stream_wrapper():
     passes in as `response`, snapshotted once at stream open, so they must be read from there
     rather than from the buffered chunks."""
     g = _make_guardrail(decisions=[_decision_response({"action": "allow"})])
-    stream = _StreamWithHiddenParams(
-        _stream_chunks(), hidden_params={"additional_headers": {"x-request-id": "req-77"}}
-    )
+    stream = _StreamWithHiddenParams(_stream_chunks(), hidden_params={"additional_headers": {"x-request-id": "req-77"}})
     await _collect(
         g.async_post_call_streaming_iterator_hook(
             user_api_key_dict=UserAPIKeyAuth(), response=stream, request_data=_request_data()
@@ -1253,9 +1251,7 @@ async def test_sampled_stream_forwards_response_headers_from_the_stream_wrapper(
         streaming_sampling_rate=100,
         decisions=[_decision_response({"action": "allow"})],
     )
-    stream = _StreamWithHiddenParams(
-        _stream_chunks(), hidden_params={"additional_headers": {"x-request-id": "req-78"}}
-    )
+    stream = _StreamWithHiddenParams(_stream_chunks(), hidden_params={"additional_headers": {"x-request-id": "req-78"}})
     await _collect(
         g.async_post_call_streaming_iterator_hook(
             user_api_key_dict=UserAPIKeyAuth(), response=stream, request_data=_request_data()
