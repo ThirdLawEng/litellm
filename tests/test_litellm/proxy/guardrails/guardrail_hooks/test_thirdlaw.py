@@ -1222,16 +1222,9 @@ async def test_streaming_forwards_response_headers_from_the_stream_wrapper():
 
 
 async def test_streaming_falls_back_to_the_stash_when_response_carries_no_hidden_params():
-    """Reproduces the production bug directly: once any other proxy callback (e.g.
-    ResponsesIDSecurity, auto-registered whenever the proxy has a database configured,
-    independent of guardrails config) is chained ahead of ThirdLaw in
-    litellm.callbacks, `response` here can be a bare async generator with no
-    _hidden_params at all -- that callback's own hook is typically just
-    `async for chunk in response: yield chunk`, which cannot itself carry attributes.
-
-    async_post_call_response_headers_hook runs earlier, directly against the proxy's
-    true unwrapped response, independent of that chain, and stashes the headers into
-    request_data -- this is what the streaming hook must fall back to.
+    """Simulates another guardrail running ahead of ThirdLaw in litellm.callbacks and
+    handing it a bare generator with no _hidden_params. The streaming hook must fall
+    back to the stash async_post_call_response_headers_hook left in request_data.
     """
     g = _make_guardrail(decisions=[_decision_response({"action": "allow"})])
 
