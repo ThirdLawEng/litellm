@@ -802,6 +802,42 @@ async def test_post_call_omits_response_headers_when_absent():
     assert "response_headers" not in _sent_payload(g)
 
 
+async def test_response_headers_hook_stashes_headers_and_returns_none():
+    """async_post_call_response_headers_hook must never inject anything into the
+    client-facing response -- it exists purely to capture headers off the true
+    response object for ThirdLaw's own later use."""
+    g = _make_guardrail()
+    response = _model_response()
+    response._hidden_params["additional_headers"] = {"x-request-id": "req-1"}
+    data = _request_data()
+    out = await g.async_post_call_response_headers_hook(
+        data=data, user_api_key_dict=UserAPIKeyAuth(), response=response
+    )
+    assert out is None
+    assert data["_thirdlaw_response_headers"] == {"x-request-id": "req-1"}
+
+
+async def test_response_headers_hook_leaves_stash_untouched_when_absent():
+    g = _make_guardrail()
+    data = _request_data()
+    await g.async_post_call_response_headers_hook(
+        data=data, user_api_key_dict=UserAPIKeyAuth(), response=_model_response()
+    )
+    assert "_thirdlaw_response_headers" not in data
+
+
+async def test_post_call_success_hook_prefers_the_stash_over_the_response_object():
+    """When both are present, the response-headers-hook stash wins -- it is the
+    reliable source; a direct read off `response` is the fallback."""
+    g = _make_guardrail(decisions=[_decision_response({"action": "allow"})])
+    response = _model_response()
+    response._hidden_params["additional_headers"] = {"x-request-id": "from-response-object"}
+    data = _request_data()
+    data["_thirdlaw_response_headers"] = {"x-request-id": "from-stash"}
+    await g.async_post_call_success_hook(data=data, user_api_key_dict=UserAPIKeyAuth(), response=response)
+    assert _sent_payload(g)["response_headers"] == {"x-request-id": "from-stash"}
+
+
 async def test_post_call_block_raises():
     g = _make_guardrail(decisions=[_decision_response({"action": "block", "message": "leaked secret"})])
     with pytest.raises(GuardrailRaisedException) as exc_info:
@@ -1183,6 +1219,37 @@ async def test_streaming_forwards_response_headers_from_the_stream_wrapper():
         )
     )
     assert _sent_payload(g)["response_headers"] == {"x-request-id": "req-77"}
+
+
+async def test_streaming_falls_back_to_the_stash_when_response_carries_no_hidden_params():
+    """Reproduces the production bug directly: once any other proxy callback (e.g.
+    ResponsesIDSecurity, auto-registered whenever the proxy has a database configured,
+    independent of guardrails config) is chained ahead of ThirdLaw in
+    litellm.callbacks, `response` here can be a bare async generator with no
+    _hidden_params at all -- that callback's own hook is typically just
+    `async for chunk in response: yield chunk`, which cannot itself carry attributes.
+
+    async_post_call_response_headers_hook runs earlier, directly against the proxy's
+    true unwrapped response, independent of that chain, and stashes the headers into
+    request_data -- this is what the streaming hook must fall back to.
+    """
+    g = _make_guardrail(decisions=[_decision_response({"action": "allow"})])
+
+    async def bare_generator_with_no_hidden_params():
+        for chunk in _stream_chunks():
+            yield chunk
+
+    request_data = _request_data()
+    request_data["_thirdlaw_response_headers"] = {"x-request-id": "req-78"}
+
+    await _collect(
+        g.async_post_call_streaming_iterator_hook(
+            user_api_key_dict=UserAPIKeyAuth(),
+            response=bare_generator_with_no_hidden_params(),
+            request_data=request_data,
+        )
+    )
+    assert _sent_payload(g)["response_headers"] == {"x-request-id": "req-78"}
 
 
 async def test_sampled_stream_forwards_response_headers_from_the_stream_wrapper():
