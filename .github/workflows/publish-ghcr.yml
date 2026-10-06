@@ -3,8 +3,13 @@ name: Publish GHCR image
 on:
   workflow_dispatch:
     inputs:
+      ref:
+        description: Git branch, tag, or SHA to build. Leave empty to build this workflow's branch
+        required: false
+        default: ""
+        type: string
       tag:
-        description: Image tag. Leave empty to use the short git SHA
+        description: Image tag. Leave empty to use the short git SHA of the built ref
         required: false
         default: ""
         type: string
@@ -17,7 +22,7 @@ on:
 permissions: {}
 
 concurrency:
-  group: publish-ghcr-${{ github.ref }}
+  group: publish-ghcr-${{ inputs.ref || github.ref }}
   cancel-in-progress: false
 
 env:
@@ -33,16 +38,19 @@ jobs:
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
       extra_tag: ${{ steps.resolve.outputs.extra_tag }}
+      build_ref: ${{ steps.resolve.outputs.build_ref }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
         with:
           persist-credentials: false
+          ref: ${{ inputs.ref != '' && inputs.ref || github.sha }}
       - name: Resolve image tags
         id: resolve
         env:
           INPUT_TAG: ${{ inputs.tag }}
           INPUT_EXTRA_TAG: ${{ inputs.extra_tag }}
+          INPUT_REF: ${{ inputs.ref }}
         run: |
           set -euo pipefail
           valid='^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'
@@ -63,11 +71,14 @@ jobs:
             fi
             extra="$INPUT_EXTRA_TAG"
           fi
+          build_ref="$(git rev-parse HEAD)"
           {
             echo "tag=${tag}"
             echo "extra_tag=${extra}"
+            echo "build_ref=${build_ref}"
           } >> "$GITHUB_OUTPUT"
-          echo "Publishing ${IMAGE_NAME}:${tag}${extra:+ and ${IMAGE_NAME}:${extra}}"
+          echo "Building ${build_ref} as ${IMAGE_NAME}:${tag}${extra:+ and ${IMAGE_NAME}:${extra}}"
+          echo "source_ref=${INPUT_REF:-$GITHUB_REF}" >> "$GITHUB_OUTPUT"
 
   build:
     name: Build ${{ matrix.platform }}
@@ -93,6 +104,7 @@ jobs:
         uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
         with:
           persist-credentials: false
+          ref: ${{ needs.meta.outputs.build_ref }}
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Log in to GHCR
@@ -113,7 +125,7 @@ jobs:
           tags: ${{ env.IMAGE_NAME }}:${{ needs.meta.outputs.tag }}-${{ matrix.suffix }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.revision=${{ needs.meta.outputs.build_ref }}
           cache-from: type=gha,scope=${{ matrix.suffix }}
           cache-to: type=gha,mode=max,scope=${{ matrix.suffix }}
 
@@ -156,4 +168,5 @@ jobs:
             if [ -n "$EXTRA_TAG" ] && [ "$EXTRA_TAG" != "$TAG" ]; then
               echo "Also tagged \`${IMAGE_NAME}:${EXTRA_TAG}\`"
             fi
+            echo "Built from \`${{ needs.meta.outputs.build_ref }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
