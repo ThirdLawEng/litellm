@@ -1,0 +1,159 @@
+name: Publish GHCR image
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Image tag. Leave empty to use the short git SHA
+        required: false
+        default: ""
+        type: string
+      extra_tag:
+        description: Extra moving tag to push alongside the version tag
+        required: false
+        default: fix-guardrails
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: publish-ghcr-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: ghcr.io/thirdlaweng/litellm
+
+jobs:
+  meta:
+    name: Resolve tags
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      extra_tag: ${{ steps.resolve.outputs.extra_tag }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+        with:
+          persist-credentials: false
+      - name: Resolve image tags
+        id: resolve
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_EXTRA_TAG: ${{ inputs.extra_tag }}
+        run: |
+          set -euo pipefail
+          valid='^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'
+          if [ -n "$INPUT_TAG" ]; then
+            if ! printf '%s' "$INPUT_TAG" | grep -Eq "$valid"; then
+              echo "invalid tag: ${INPUT_TAG}" >&2
+              exit 1
+            fi
+            tag="$INPUT_TAG"
+          else
+            tag="$(git rev-parse --short HEAD)"
+          fi
+          extra=""
+          if [ -n "$INPUT_EXTRA_TAG" ]; then
+            if ! printf '%s' "$INPUT_EXTRA_TAG" | grep -Eq "$valid"; then
+              echo "invalid extra_tag: ${INPUT_EXTRA_TAG}" >&2
+              exit 1
+            fi
+            extra="$INPUT_EXTRA_TAG"
+          fi
+          {
+            echo "tag=${tag}"
+            echo "extra_tag=${extra}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Publishing ${IMAGE_NAME}:${tag}${extra:+ and ${IMAGE_NAME}:${extra}}"
+
+  build:
+    name: Build ${{ matrix.platform }}
+    needs: meta
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    environment: ghcr-publish
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            suffix: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            suffix: arm64
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+        with:
+          persist-credentials: false
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push platform image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: true
+          provenance: false
+          sbom: false
+          tags: ${{ env.IMAGE_NAME }}:${{ needs.meta.outputs.tag }}-${{ matrix.suffix }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.suffix }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.suffix }}
+
+  manifest:
+    name: Create multi-arch manifest
+    needs:
+      - meta
+      - build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: ghcr-publish
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create and push manifest
+        env:
+          TAG: ${{ needs.meta.outputs.tag }}
+          EXTRA_TAG: ${{ needs.meta.outputs.extra_tag }}
+        run: |
+          set -euo pipefail
+          amd64="${IMAGE_NAME}:${TAG}-amd64"
+          arm64="${IMAGE_NAME}:${TAG}-arm64"
+          args=(-t "${IMAGE_NAME}:${TAG}")
+          if [ -n "$EXTRA_TAG" ] && [ "$EXTRA_TAG" != "$TAG" ]; then
+            args+=(-t "${IMAGE_NAME}:${EXTRA_TAG}")
+          fi
+          docker buildx imagetools create "${args[@]}" "$amd64" "$arm64"
+          docker buildx imagetools inspect "${IMAGE_NAME}:${TAG}"
+          {
+            echo "Pushed \`${IMAGE_NAME}:${TAG}\`"
+            if [ -n "$EXTRA_TAG" ] && [ "$EXTRA_TAG" != "$TAG" ]; then
+              echo "Also tagged \`${IMAGE_NAME}:${EXTRA_TAG}\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
