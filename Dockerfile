@@ -33,6 +33,7 @@ RUN curl -fsSL -o pgbouncer.tar.gz "https://www.pgbouncer.org/downloads/files/${
 FROM --platform=$BUILDPLATFORM $UI_BUILD_IMAGE AS ui-builder
 
 ENV NEXT_TELEMETRY_DISABLED=1 \
+    NODE_OPTIONS=--max-old-space-size=6144 \
     npm_config_fund=false \
     npm_config_audit=false
 
